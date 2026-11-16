@@ -1,0 +1,6 @@
+{
+  "name": "BazarBot — Telegram Auto-Poster",
+  "description": "Automated Telegram product photo scheduler and buy-sell group broadcaster for online merchants.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -3,6 +3,7 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import https from 'node:https';
 import { TelegramClient, Api, sessions, password as tgPassword } from 'telegram';
 import type {
   AppStateResponse,
@@ -533,7 +534,76 @@ async function sendProductViaUserbot(
   }
 }
 
-// ---------- OFFICIAL BOT API ----------
+// ---------- OFFICIAL BOT API (Pure node:https, zero undici/Wasm) ----------
+
+function httpsPostBuffer<T>(
+  urlPath: string,
+  bodyBuffer: Buffer,
+  contentType: string
+): Promise<{ ok: boolean; result?: T; description?: string }> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'api.telegram.org',
+        port: 443,
+        path: urlPath,
+        method: 'POST',
+        headers: {
+          'Content-Type': contentType,
+          'Content-Length': bodyBuffer.length,
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          try {
+            const text = Buffer.concat(chunks).toString('utf-8');
+            resolve(JSON.parse(text) as { ok: boolean; result?: T; description?: string });
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(bodyBuffer);
+    req.end();
+  });
+}
+
+function buildMultipartBody(
+  fields: Array<{ name: string; value: string }>,
+  files: Array<{ name: string; filename: string; mime: string; buffer: Buffer }>
+): { body: Buffer; contentType: string } {
+  const boundary = `----BazarBotBoundary${crypto.randomBytes(12).toString('hex')}`;
+  const parts: Buffer[] = [];
+
+  for (const f of fields) {
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${f.name}"\r\n\r\n${f.value}\r\n`,
+        'utf-8'
+      )
+    );
+  }
+  for (const file of files) {
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${file.name}"; filename="${file.filename}"\r\nContent-Type: ${file.mime}\r\n\r\n`,
+        'utf-8'
+      )
+    );
+    parts.push(file.buffer);
+    parts.push(Buffer.from('\r\n', 'utf-8'));
+  }
+  parts.push(Buffer.from(`--${boundary}--\r\n`, 'utf-8'));
+
+  return {
+    body: Buffer.concat(parts),
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
+}
 
 async function telegramRequest<T>(
   method: string,
@@ -544,14 +614,8 @@ async function telegramRequest<T>(
     return { ok: false, description: 'TELEGRAM_BOT_TOKEN সেট করা নেই' };
   }
 
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  const data = (await response.json()) as { ok: boolean; result?: T; description?: string };
-  return data;
+  const payload = body ? Buffer.from(JSON.stringify(body), 'utf-8') : Buffer.alloc(0);
+  return httpsPostBuffer<T>(`/bot${token}/${method}`, payload, 'application/json');
 }
 
 async function verifyBotToken(): Promise<void> {
@@ -774,25 +838,20 @@ async function sendProductToGroup(
       const localFile = resolveLocalImageFile(img);
 
       if (localFile) {
-        const form = new FormData();
-        form.append('chat_id', group.chatId);
-        form.append('caption', caption);
-        form.append('parse_mode', 'HTML');
-        if (replyMarkup) {
-          form.append('reply_markup', JSON.stringify(replyMarkup));
-        }
-        const blob = new Blob([new Uint8Array(localFile.buffer)], { type: localFile.mime });
-        form.append('photo', blob, localFile.filename);
-
-        const response = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
-          method: 'POST',
-          body: form,
-        });
-        const data = (await response.json()) as {
-          ok: boolean;
-          result?: { message_id: number };
-          description?: string;
-        };
+        const fields = [
+          { name: 'chat_id', value: group.chatId },
+          { name: 'caption', value: caption },
+          { name: 'parse_mode', value: 'HTML' },
+          ...(replyMarkup ? [{ name: 'reply_markup', value: JSON.stringify(replyMarkup) }] : []),
+        ];
+        const mp = buildMultipartBody(fields, [
+          { name: 'photo', filename: localFile.filename, mime: localFile.mime, buffer: localFile.buffer },
+        ]);
+        const data = await httpsPostBuffer<{ message_id: number }>(
+          `/bot${token}/sendPhoto`,
+          mp.body,
+          mp.contentType
+        );
         return data.ok
           ? { ok: true, messageId: data.result?.message_id }
           : { ok: false, error: data.description ?? 'sendPhoto failed' };
@@ -810,21 +869,24 @@ async function sendProductToGroup(
         : { ok: false, error: res.description ?? 'sendPhoto failed' };
     }
 
-    const form = new FormData();
-    form.append('chat_id', group.chatId);
     const mediaPayload: Array<{
       type: 'photo';
       media: string;
       caption?: string;
       parse_mode?: string;
     }> = [];
+    const files: Array<{ name: string; filename: string; mime: string; buffer: Buffer }> = [];
 
     images.forEach((img, idx) => {
       const localFile = resolveLocalImageFile(img);
       const attachKey = `photo_${idx}`;
       if (localFile) {
-        const blob = new Blob([new Uint8Array(localFile.buffer)], { type: localFile.mime });
-        form.append(attachKey, blob, localFile.filename);
+        files.push({
+          name: attachKey,
+          filename: localFile.filename,
+          mime: localFile.mime,
+          buffer: localFile.buffer,
+        });
       }
 
       mediaPayload.push({
@@ -834,17 +896,18 @@ async function sendProductToGroup(
       });
     });
 
-    form.append('media', JSON.stringify(mediaPayload));
-
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMediaGroup`, {
-      method: 'POST',
-      body: form,
-    });
-    const data = (await response.json()) as {
-      ok: boolean;
-      result?: Array<{ message_id: number }>;
-      description?: string;
-    };
+    const mp = buildMultipartBody(
+      [
+        { name: 'chat_id', value: group.chatId },
+        { name: 'media', value: JSON.stringify(mediaPayload) },
+      ],
+      files
+    );
+    const data = await httpsPostBuffer<Array<{ message_id: number }>>(
+      `/bot${token}/sendMediaGroup`,
+      mp.body,
+      mp.contentType
+    );
 
     return data.ok
       ? { ok: true, messageId: data.result?.[0]?.message_id }
@@ -1646,8 +1709,12 @@ async function startServer(): Promise<void> {
   const distIndex = path.join(distDir, 'index.html');
   if (process.env.NODE_ENV !== 'production' || !fs.existsSync(distIndex)) {
     const { createServer: createViteServer } = await import('vite');
+    const disableHmr = process.env.NODE_ENV === 'production' || process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ...(disableHmr ? { hmr: false } : {}),
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

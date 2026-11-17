@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import type { UserbotStatus } from '../types.ts';
+import { withBase } from '../basePath.ts';
 
 interface UserbotLoginCardProps {
   userbotStatus: UserbotStatus;
@@ -35,7 +36,7 @@ export const UserbotLoginCard: React.FC<UserbotLoginCardProps> = ({
     setLocalError(null);
     setSubmitting(true);
     try {
-      const res = await fetch('/api/userbot/send-code', {
+      const res = await fetch(withBase('/api/userbot/send-code'), {
         method: 'POST',
         headers: authHeaders(true),
         body: JSON.stringify({ phoneNumber }),
@@ -68,7 +69,7 @@ export const UserbotLoginCard: React.FC<UserbotLoginCardProps> = ({
     setLocalError(null);
     setSubmitting(true);
     try {
-      const res = await fetch('/api/userbot/verify-code', {
+      const res = await fetch(withBase('/api/userbot/verify-code'), {
         method: 'POST',
         headers: authHeaders(true),
         body: JSON.stringify({ code: otpCode }),
@@ -108,7 +109,7 @@ export const UserbotLoginCard: React.FC<UserbotLoginCardProps> = ({
     setLocalError(null);
     setSubmitting(true);
     try {
-      const res = await fetch('/api/userbot/verify-password', {
+      const res = await fetch(withBase('/api/userbot/verify-password'), {
         method: 'POST',
         headers: authHeaders(true),
         body: JSON.stringify({ password }),
@@ -138,7 +139,7 @@ export const UserbotLoginCard: React.FC<UserbotLoginCardProps> = ({
   const handleSyncDialogs = async () => {
     setSyncingDialogs(true);
     try {
-      const res = await fetch('/api/userbot/sync-dialogs', {
+      const res = await fetch(withBase('/api/userbot/sync-dialogs'), {
         method: 'POST',
         headers: authHeaders(false),
       });
@@ -164,7 +165,7 @@ export const UserbotLoginCard: React.FC<UserbotLoginCardProps> = ({
     setSubmitting(true);
     setLocalError(null);
     try {
-      const res = await fetch('/api/userbot/logout', {
+      const res = await fetch(withBase('/api/userbot/logout'), {
         method: 'POST',
         headers: authHeaders(false),
       });

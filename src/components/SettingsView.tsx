@@ -6,6 +6,7 @@ import type {
   UserbotStatus,
 } from '../types.ts';
 import { UserbotLoginCard } from './UserbotLoginCard.tsx';
+import { withBase } from '../basePath.ts';
 
 const INTERVAL_PRESETS = [
   { label: '৪০ মিনিট', minutes: 40 },
@@ -55,7 +56,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
     setUpdatingPwd(true);
     try {
-      const res = await fetch('/api/auth/change-password', {
+      const res = await fetch(withBase('/api/auth/change-password'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

@@ -1,5 +1,6 @@
 import React, { useState, useRef } from 'react';
 import type { ProductItem } from '../types.ts';
+import { withBase } from '../basePath.ts';
 
 interface ProductModalProps {
   initialProduct: ProductItem | null;
@@ -164,7 +165,7 @@ export const ProductModal: React.FC<ProductModalProps> = ({
                   className="relative aspect-[4/3] rounded-[10px] border border-[#e2e8f0] overflow-hidden bg-[#f8fafc] group"
                 >
                   <img
-                    src={img}
+                    src={withBase(img)}
                     alt={`Post ${idx + 1}`}
                     referrerPolicy="no-referrer"
                     className="w-full h-full object-cover"

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import type { ProductItem, SchedulerConfig } from '../types.ts';
+import { withBase } from '../basePath.ts';
 
 interface TelegramPreviewProps {
   products: ProductItem[];
@@ -127,7 +128,7 @@ export const TelegramPreview: React.FC<TelegramPreviewProps> = ({
             {primaryImage && !imgErrorMap[primaryImage] && (
               <div className="relative bg-[#f1f5f9] aspect-[4/3] w-full overflow-hidden">
                 <img
-                  src={primaryImage}
+                  src={withBase(primaryImage)}
                   alt={product.name}
                   referrerPolicy="no-referrer"
                   onError={() => setImgErrorMap((prev) => ({ ...prev, [primaryImage]: true }))}

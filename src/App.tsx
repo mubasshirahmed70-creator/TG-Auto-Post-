@@ -10,6 +10,7 @@ import { TelegramPreview } from './components/TelegramPreview.tsx';
 import { ProductModal } from './components/ProductModal.tsx';
 import { SetupGuideView } from './components/SetupGuideView.tsx';
 import { SettingsView } from './components/SettingsView.tsx';
+import { withBase } from './basePath.ts';
 
 type NavTab = 'overview' | 'products' | 'groups' | 'logs' | 'setup' | 'settings';
 
@@ -271,7 +272,7 @@ export default function App() {
       if (authToken) {
         headers.set('Authorization', `Bearer ${authToken}`);
       }
-      const res = await fetch(url, { ...options, headers });
+      const res = await fetch(withBase(url), { ...options, headers });
       if (res.status === 401) {
         handleUnauthorized();
       }
@@ -290,7 +291,7 @@ export default function App() {
         return;
       }
       try {
-        const res = await fetch('/api/auth/status', {
+        const res = await fetch(withBase('/api/auth/status'), {
           headers: { Authorization: `Bearer ${authToken}` },
         });
         const data = (await res.json()) as { authenticated?: boolean };
@@ -323,7 +324,7 @@ export default function App() {
     setLoggingIn(true);
     setLoginError(null);
     try {
-      const res = await fetch('/api/auth/login', {
+      const res = await fetch(withBase('/api/auth/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: loginPassword }),
@@ -352,7 +353,7 @@ export default function App() {
 
   const handleWebsiteLogout = async () => {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetch(withBase('/api/auth/logout'), { method: 'POST' });
     } catch {
       // ignore
     }
@@ -1166,7 +1167,7 @@ export default function App() {
                           {cover && !imgErrors[cover] ? (
                             <div className="aspect-[4/3] bg-[#f1f5f9] relative overflow-hidden border-b border-[#f1f5f9]">
                               <img
-                                src={cover}
+                                src={withBase(cover)}
                                 alt={product.name}
                                 referrerPolicy="no-referrer"
                                 onError={() =>

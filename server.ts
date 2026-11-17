@@ -1151,9 +1151,68 @@ async function schedulerTick(): Promise<void> {
   }
 }
 
+function normalizeBasePath(raw?: string | null): string {
+  if (!raw) return '';
+  const cleaned = raw.trim().replace(/^\/+|\/+$/g, '');
+  return cleaned ? `/${cleaned}` : '';
+}
+
+function detectSubpathPrefix(reqPath: string, isProd: boolean): string {
+  const envBase = normalizeBasePath(
+    process.env.APP_BASE_PATH || process.env.PASSENGER_BASE_URI || process.env.LSNODE_BASE_URI
+  );
+  if (envBase) {
+    return reqPath === envBase || reqPath.startsWith(`${envBase}/`) ? envBase : '';
+  }
+  if (!isProd) return '';
+  const match = reqPath.match(/^\/([^/]+)(\/.*)?$/);
+  if (!match) return '';
+  const seg = match[1];
+  const rest = match[2] || '';
+  const reservedRootSegments = new Set([
+    'api',
+    'assets',
+    'uploads',
+    'src',
+    'favicon.ico',
+    'robots.txt',
+  ]);
+  if (reservedRootSegments.has(seg)) return '';
+  if (
+    rest === '' ||
+    rest === '/' ||
+    rest.startsWith('/api/') ||
+    rest.startsWith('/assets/') ||
+    rest.startsWith('/uploads/') ||
+    rest.startsWith('/src/assets/images/')
+  ) {
+    return `/${seg}`;
+  }
+  return '';
+}
+
 async function startServer(): Promise<void> {
   const app = express();
   app.use(express.json({ limit: '20mb' }));
+
+  const isProd = process.env.NODE_ENV === 'production';
+  app.use((req, res, next) => {
+    const envBase = normalizeBasePath(
+      process.env.APP_BASE_PATH || process.env.PASSENGER_BASE_URI || process.env.LSNODE_BASE_URI
+    );
+    const reqPrefix = detectSubpathPrefix(req.path, isProd);
+    res.locals.basePath = envBase || reqPrefix;
+    if (
+      reqPrefix &&
+      (req.url === reqPrefix ||
+        req.url.startsWith(`${reqPrefix}/`) ||
+        req.url.startsWith(`${reqPrefix}?`))
+    ) {
+      const stripped = req.url.slice(reqPrefix.length);
+      req.url = stripped ? (stripped.startsWith('/') ? stripped : `/${stripped}`) : '/';
+    }
+    next();
+  });
 
   app.use('/uploads', express.static(UPLOADS_DIR));
   app.use('/src/assets/images', express.static(GENERATED_IMAGES_DIR));
@@ -1719,9 +1778,15 @@ async function startServer(): Promise<void> {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(distDir));
+    app.use(express.static(distDir, { index: false, redirect: false }));
     app.get('*', (_req, res) => {
-      res.sendFile(distIndex);
+      const basePath = typeof res.locals.basePath === 'string' ? res.locals.basePath : '';
+      const rawHtml = fs.readFileSync(distIndex, 'utf8');
+      const assetPrefix = `${basePath}/assets/`;
+      const html = rawHtml
+        .replace('</head>', `    <script>window.__APP_BASE__=${JSON.stringify(basePath)};</script>\n  </head>`)
+        .replaceAll('"/assets/', `"${assetPrefix}`);
+      res.type('html').send(html);
     });
   }
 

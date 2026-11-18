@@ -7,6 +7,9 @@ import { Scanner } from '@tailwindcss/oxide';
 const rootDir = process.cwd();
 const distDir = path.join(rootDir, 'dist');
 const assetsDir = path.join(distDir, 'assets');
+const buildTag = Date.now().toString(36);
+const cssFileName = `index-${buildTag}.css`;
+const jsFileName = `index-${buildTag}.js`;
 
 async function buildAll() {
   const start = Date.now();
@@ -31,7 +34,7 @@ async function buildAll() {
     loader: 'css',
     minify: true,
   });
-  fs.writeFileSync(path.join(assetsDir, 'index.css'), minifiedCss.code, 'utf8');
+  fs.writeFileSync(path.join(assetsDir, cssFileName), minifiedCss.code, 'utf8');
 
   // 2. Bundle React client with esbuild (native Go binary, fast and low memory)
   await esbuild.build({
@@ -44,7 +47,7 @@ async function buildAll() {
     define: {
       'process.env.NODE_ENV': '"production"',
     },
-    outfile: path.join(assetsDir, 'index.js'),
+    outfile: path.join(assetsDir, jsFileName),
     plugins: [
       {
         name: 'strip-css-imports',
@@ -62,11 +65,11 @@ async function buildAll() {
     ],
   });
 
-  // 3. Emit production dist/index.html
+  // 3. Emit production dist/index.html with hashed asset URLs (busts browser/Cloudflare/htaccess cache)
   const htmlTemplate = fs.readFileSync(path.join(rootDir, 'index.html'), 'utf8');
   const prodHtml = htmlTemplate.replace(
     '<script type="module" src="/src/main.tsx"></script>',
-    '<link rel="stylesheet" href="/assets/index.css" />\n    <script type="module" src="/assets/index.js"></script>',
+    `<link rel="stylesheet" href="/assets/${cssFileName}" />\n    <script type="module" src="/assets/${jsFileName}"></script>`,
   );
   fs.writeFileSync(path.join(distDir, 'index.html'), prodHtml, 'utf8');
 

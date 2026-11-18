@@ -403,8 +403,14 @@ export default function App() {
 
   const handleSaveConfig = async (override?: Partial<SchedulerConfig>) => {
     if (!currentConfig) return;
+    if (override?.enabled === true && activeProductsCount === 0) {
+      pushToast(
+        'error',
+        'কোনো সক্রিয় পোস্ট তৈরি করা নেই! আগে "পোস্ট" ট্যাব থেকে অন্তত ১টি পোস্ট তৈরি করুন, তারপর Start দিন।'
+      );
+      return;
+    }
     const payload = { ...currentConfig, ...(override ?? {}) };
-    setDraftConfig(payload);
     setSavingConfig(true);
     try {
       const res = await apiFetch('/api/config', {
@@ -412,10 +418,14 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!res.ok) throw new Error('Config save failed');
-      const updated = (await res.json()) as SchedulerConfig;
-      setDraftConfig(updated);
-      setState((prev) => (prev ? { ...prev, config: updated } : prev));
+      const raw = (await res.json()) as SchedulerConfig & { error?: string };
+      if (!res.ok) {
+        pushToast('error', raw.error ?? 'সেটিংস সেভ করা যায়নি');
+        await fetchState(false);
+        return;
+      }
+      setDraftConfig(raw);
+      setState((prev) => (prev ? { ...prev, config: raw } : prev));
       if (override && typeof override.enabled === 'boolean') {
         pushToast(
           override.enabled ? 'success' : 'info',
@@ -913,12 +923,24 @@ export default function App() {
                 </div>
 
                 {/* 2. Big Start / Stop System Control Button */}
+                {!currentConfig.enabled && activeProductsCount === 0 && (
+                  <div className="p-2.5 rounded-[10px] bg-[#fffbeb] border border-[#fde68a] text-[11.5px] font-bold text-[#b45309] flex items-center gap-2">
+                    <i className="ri-error-warning-fill text-sm shrink-0" />
+                    <span>
+                      কোনো সক্রিয় পোস্ট তৈরি করা নেই — আগে নিচের <strong>পোস্ট</strong> ট্যাব থেকে অন্তত ১টি পোস্ট তৈরি করুন, নাহলে সিস্টেম Start হবে না।
+                    </span>
+                  </div>
+                )}
                 <button
                   type="button"
                   disabled={savingConfig}
                   onClick={() => void handleSaveConfig({ enabled: !currentConfig.enabled })}
                   className={`ui-btn w-full py-3.5 text-[14.5px] font-extrabold rounded-[12px] ${
-                    currentConfig.enabled ? 'ui-btn-stop' : 'ui-btn-success'
+                    currentConfig.enabled
+                      ? 'ui-btn-stop'
+                      : activeProductsCount === 0
+                      ? 'ui-btn-outline opacity-75'
+                      : 'ui-btn-success'
                   }`}
                 >
                   <i
@@ -935,6 +957,8 @@ export default function App() {
                       ? 'আপডেট হচ্ছে...'
                       : currentConfig.enabled
                       ? 'Stop — অটো-পোস্ট সিস্টেম বন্ধ করুন'
+                      : activeProductsCount === 0
+                      ? 'Start বন্ধ (আগে পোস্ট তৈরি করুন)'
                       : 'Start — অটো-পোস্ট সিস্টেম চালু করুন'}
                   </span>
                 </button>

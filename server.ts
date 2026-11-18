@@ -38,53 +38,16 @@ const PORT: number | string = rawPort
 const DATA_DIR = path.resolve('data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
+const SCHEDULER_LOCK_FILE = path.join(DATA_DIR, 'scheduler.lock');
 const GENERATED_IMAGES_DIR = path.resolve('src/assets/images');
 
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 function createDefaultStore(): StoreData {
-  const now = new Date().toISOString();
   const nextRun = new Date(Date.now() + 150 * 60 * 1000).toISOString();
 
   return {
-    products: [
-      {
-        id: 'prod_smartwatch_01',
-        name: 'AMOLED Smart Watch Series 9',
-        caption:
-          '🔥 AMOLED Smart Watch Series 9 (Matte Black)\nদাম: ১,৮৫০ টাকা (অফার প্রাইস)\n\n• ব্লুটুথ কলিং ও ৭ দিন ব্যাটারি ব্যাকআপ\n• সারা দেশে ক্যাশ অন ডেলিভারি',
-        link: 'https://t.me/',
-        images: ['/src/assets/images/product_smartwatch_1794788785090.jpg'],
-        active: true,
-        postCount: 0,
-        lastPostedAt: null,
-        createdAt: now,
-      },
-      {
-        id: 'prod_earbuds_02',
-        name: 'ANC Pro Wireless Earbuds',
-        caption:
-          '🎧 ANC Pro Wireless Earbuds (Olive Sage)\nদাম: ১,২৯০ টাকা\n\n• ৩২ ঘণ্টা প্লে-টাইম + Type-C ফাস্ট চার্জিং\n• ৭ দিনের রিপ্লেসমেন্ট গ্যারান্টি',
-        link: 'https://t.me/',
-        images: ['/src/assets/images/product_earbuds_1794788785844.jpg'],
-        active: true,
-        postCount: 0,
-        lastPostedAt: null,
-        createdAt: now,
-      },
-      {
-        id: 'prod_leather_03',
-        name: 'হ্যান্ডক্রাফটেড লেদার মেসেঞ্জার ব্যাগ',
-        caption:
-          '💼 হ্যান্ডক্রাফটেড লেদার ক্রসবডি মেসেঞ্জার ব্যাগ\nদাম: ২,৬৫০ টাকা\n\n• ১০০% জেনুইন কাউ লেদার\n• ১১ ইঞ্চি ট্যাবলেট/আইপ্যাড ফিট হয়',
-        link: 'https://t.me/',
-        images: ['/src/assets/images/product_leather_bag_1794788785769.jpg'],
-        active: true,
-        postCount: 0,
-        lastPostedAt: null,
-        createdAt: now,
-      },
-    ],
+    products: [],
     groups: [],
     config: {
       enabled: false,
@@ -110,42 +73,72 @@ function createDefaultStore(): StoreData {
   };
 }
 
-function loadStore(): StoreData {
+function parseStoreFromDisk(): StoreData | null {
   try {
-    if (fs.existsSync(STORE_FILE)) {
-      const raw = fs.readFileSync(STORE_FILE, 'utf-8');
-      const parsed = JSON.parse(raw) as Partial<StoreData>;
-      const defaults = createDefaultStore();
-      return {
-        products: Array.isArray(parsed.products) ? parsed.products : defaults.products,
-        groups: Array.isArray(parsed.groups) ? parsed.groups : defaults.groups,
-        config: { ...defaults.config, ...(parsed.config ?? {}) },
-        logs: Array.isArray(parsed.logs) ? parsed.logs : [],
-        updateOffset: typeof parsed.updateOffset === 'number' ? parsed.updateOffset : 0,
-        userSessionString: typeof parsed.userSessionString === 'string' ? parsed.userSessionString : '',
-        authSecret:
-          typeof parsed.authSecret === 'string' && parsed.authSecret.length >= 16
-            ? parsed.authSecret
-            : defaults.authSecret,
-        adminPasswordSalt:
-          typeof parsed.adminPasswordSalt === 'string' ? parsed.adminPasswordSalt : undefined,
-        adminPasswordHash:
-          typeof parsed.adminPasswordHash === 'string' ? parsed.adminPasswordHash : undefined,
-      };
-    }
+    if (!fs.existsSync(STORE_FILE)) return null;
+    const raw = fs.readFileSync(STORE_FILE, 'utf-8');
+    if (!raw.trim()) return null;
+    const parsed = JSON.parse(raw) as Partial<StoreData>;
+    const defaults = createDefaultStore();
+    return {
+      products: Array.isArray(parsed.products) ? parsed.products : [],
+      groups: Array.isArray(parsed.groups) ? parsed.groups : [],
+      config: { ...defaults.config, ...(parsed.config ?? {}) },
+      logs: Array.isArray(parsed.logs) ? parsed.logs : [],
+      updateOffset: typeof parsed.updateOffset === 'number' ? parsed.updateOffset : 0,
+      userSessionString: typeof parsed.userSessionString === 'string' ? parsed.userSessionString : '',
+      authSecret:
+        typeof parsed.authSecret === 'string' && parsed.authSecret.length >= 16
+          ? parsed.authSecret
+          : defaults.authSecret,
+      adminPasswordSalt:
+        typeof parsed.adminPasswordSalt === 'string' ? parsed.adminPasswordSalt : undefined,
+      adminPasswordHash:
+        typeof parsed.adminPasswordHash === 'string' ? parsed.adminPasswordHash : undefined,
+    };
   } catch (err) {
-    console.error('Failed to load store.json, recreating defaults:', err);
+    console.error('Failed to read store.json:', err);
+    return null;
   }
+}
+
+function saveStore(data: StoreData): void {
+  const tmpFile = `${STORE_FILE}.tmp.${process.pid}.${Date.now()}`;
+  fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
+  fs.renameSync(tmpFile, STORE_FILE);
+}
+
+function loadStore(): StoreData {
+  const fromDisk = parseStoreFromDisk();
+  if (fromDisk) return fromDisk;
   const initial = createDefaultStore();
   saveStore(initial);
   return initial;
 }
 
-function saveStore(data: StoreData): void {
-  fs.writeFileSync(STORE_FILE, JSON.stringify(data, null, 2), 'utf-8');
+const store = loadStore();
+
+function reloadStoreFromDisk(): StoreData {
+  const fresh = parseStoreFromDisk();
+  if (!fresh) return store;
+  store.products = fresh.products;
+  store.groups = fresh.groups;
+  store.config = fresh.config;
+  store.logs = fresh.logs;
+  store.updateOffset = fresh.updateOffset;
+  store.userSessionString = fresh.userSessionString;
+  store.authSecret = fresh.authSecret;
+  store.adminPasswordSalt = fresh.adminPasswordSalt;
+  store.adminPasswordHash = fresh.adminPasswordHash;
+  return store;
 }
 
-const store = loadStore();
+function mutateStore<T>(mutator: (s: StoreData) => T): T {
+  reloadStoreFromDisk();
+  const result = mutator(store);
+  saveStore(store);
+  return result;
+}
 
 function getApiCredentials(): { apiId: number; apiHash: string; configured: boolean } {
   const apiId = Number.parseInt(process.env.TELEGRAM_API_ID?.trim() ?? '', 10);
@@ -167,6 +160,7 @@ function hashPasswordWithSalt(password: string, salt: string): string {
 }
 
 function verifySubmittedPassword(submitted: string): boolean {
+  reloadStoreFromDisk();
   if (store.adminPasswordSalt && store.adminPasswordHash) {
     const derived = hashPasswordWithSalt(submitted, store.adminPasswordSalt);
     return crypto.timingSafeEqual(
@@ -181,6 +175,7 @@ function verifySubmittedPassword(submitted: string): boolean {
 }
 
 function getSigningKey(): string {
+  reloadStoreFromDisk();
   const passwordMaterial = store.adminPasswordHash ?? getAdminPassword();
   return crypto
     .createHmac('sha256', store.authSecret)
@@ -394,8 +389,9 @@ async function initUserbotClient(): Promise<void> {
       userbotStatus.connected = false;
       userbotStatus.authStep = 'idle';
       userbotStatus.user = null;
-      store.userSessionString = '';
-      saveStore(store);
+      mutateStore((s) => {
+        s.userSessionString = '';
+      });
       return;
     }
 
@@ -428,56 +424,59 @@ async function syncUserbotDialogs(): Promise<number> {
   }
 
   const dialogs = await userClient.getDialogs({ limit: 150 });
-  let addedOrUpdated = 0;
+  const addedOrUpdated = mutateStore((s) => {
+    let count = 0;
 
-  for (const d of dialogs) {
-    if (!d.isGroup && !d.isChannel) continue;
+    for (const d of dialogs) {
+      if (!d.isGroup && !d.isChannel) continue;
 
-    // Skip read-only broadcast channels unless user is creator or has post rights
-    const entity = d.entity;
-    if (entity instanceof Api.Channel && entity.broadcast && !entity.creator && !entity.adminRights?.postMessages) {
-      continue;
+      // Skip read-only broadcast channels unless user is creator or has post rights
+      const entity = d.entity;
+      if (entity instanceof Api.Channel && entity.broadcast && !entity.creator && !entity.adminRights?.postMessages) {
+        continue;
+      }
+
+      const chatIdStr = d.id ? d.id.toString() : '';
+      if (!chatIdStr) continue;
+
+      const title = d.title || d.name || `Group ${chatIdStr}`;
+      const username =
+        entity && 'username' in entity && typeof entity.username === 'string'
+          ? entity.username
+          : undefined;
+      const type: TelegramGroup['type'] = d.isGroup
+        ? entity instanceof Api.Channel
+          ? 'supergroup'
+          : 'group'
+        : 'channel';
+
+      const existing = s.groups.find((g) => g.chatId === chatIdStr);
+      if (existing) {
+        existing.title = title;
+        existing.username = username ?? existing.username;
+        existing.type = type;
+        count++;
+      } else {
+        s.groups.unshift({
+          id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+          chatId: chatIdStr,
+          title,
+          username,
+          type,
+          enabled: false, // Let merchant toggle on the exact buy-sell groups they want!
+          postCount: 0,
+          lastPostedAt: null,
+          lastError: null,
+          addedVia: 'userbot_sync',
+          addedAt: new Date().toISOString(),
+        });
+        count++;
+      }
     }
 
-    const chatIdStr = d.id ? d.id.toString() : '';
-    if (!chatIdStr) continue;
+    return count;
+  });
 
-    const title = d.title || d.name || `Group ${chatIdStr}`;
-    const username =
-      entity && 'username' in entity && typeof entity.username === 'string'
-        ? entity.username
-        : undefined;
-    const type: TelegramGroup['type'] = d.isGroup
-      ? entity instanceof Api.Channel
-        ? 'supergroup'
-        : 'group'
-      : 'channel';
-
-    const existing = store.groups.find((g) => g.chatId === chatIdStr);
-    if (existing) {
-      existing.title = title;
-      existing.username = username ?? existing.username;
-      existing.type = type;
-      addedOrUpdated++;
-    } else {
-      store.groups.unshift({
-        id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-        chatId: chatIdStr,
-        title,
-        username,
-        type,
-        enabled: false, // Let merchant toggle on the exact buy-sell groups they want!
-        postCount: 0,
-        lastPostedAt: null,
-        lastError: null,
-        addedVia: 'userbot_sync',
-        addedAt: new Date().toISOString(),
-      });
-      addedOrUpdated++;
-    }
-  }
-
-  saveStore(store);
   return addedOrUpdated;
 }
 
@@ -678,33 +677,34 @@ function upsertGroupFromChat(
     return null;
   }
 
+  const groupType: TelegramGroup['type'] = chat.type;
   const chatIdStr = String(chat.id);
-  const existing = store.groups.find((g) => g.chatId === chatIdStr);
-  if (existing) {
-    existing.title = chat.title ?? existing.title;
-    existing.username = chat.username ?? existing.username;
-    existing.type = chat.type;
-    existing.lastError = null;
-    saveStore(store);
-    return existing;
-  }
+  return mutateStore((s) => {
+    const existing = s.groups.find((g) => g.chatId === chatIdStr);
+    if (existing) {
+      existing.title = chat.title ?? existing.title;
+      existing.username = chat.username ?? existing.username;
+      existing.type = groupType;
+      existing.lastError = null;
+      return existing;
+    }
 
-  const created: TelegramGroup = {
-    id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-    chatId: chatIdStr,
-    title: chat.title ?? (chat.username ? `@${chat.username}` : `Group ${chatIdStr}`),
-    username: chat.username,
-    type: chat.type,
-    enabled: true,
-    postCount: 0,
-    lastPostedAt: null,
-    lastError: null,
-    addedVia,
-    addedAt: new Date().toISOString(),
-  };
-  store.groups.unshift(created);
-  saveStore(store);
-  return created;
+    const created: TelegramGroup = {
+      id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      chatId: chatIdStr,
+      title: chat.title ?? (chat.username ? `@${chat.username}` : `Group ${chatIdStr}`),
+      username: chat.username,
+      type: groupType,
+      enabled: true,
+      postCount: 0,
+      lastPostedAt: null,
+      lastError: null,
+      addedVia,
+      addedAt: new Date().toISOString(),
+    };
+    s.groups.unshift(created);
+    return created;
+  });
 }
 
 async function pollTelegramUpdates(): Promise<void> {
@@ -715,6 +715,7 @@ async function pollTelegramUpdates(): Promise<void> {
   }
 
   try {
+    reloadStoreFromDisk();
     botStatus.pollingActive = true;
     const res = await telegramRequest<TelegramUpdatePayload[]>('getUpdates', {
       offset: store.updateOffset,
@@ -731,9 +732,10 @@ async function pollTelegramUpdates(): Promise<void> {
     botStatus.connected = true;
     botStatus.lastPollError = null;
     const updates = res.result ?? [];
+    let nextOffset = store.updateOffset;
 
     for (const upd of updates) {
-      store.updateOffset = Math.max(store.updateOffset, upd.update_id + 1);
+      nextOffset = Math.max(nextOffset, upd.update_id + 1);
 
       if (upd.my_chat_member) {
         const { chat, new_chat_member } = upd.my_chat_member;
@@ -742,12 +744,13 @@ async function pollTelegramUpdates(): Promise<void> {
           if (memberStatus === 'member' || memberStatus === 'administrator') {
             upsertGroupFromChat(chat, 'auto');
           } else if (memberStatus === 'left' || memberStatus === 'kicked') {
-            const existing = store.groups.find((g) => g.chatId === String(chat.id));
-            if (existing) {
-              existing.enabled = false;
-              existing.lastError = 'বটটি গ্রুপ থেকে রিমুভ করা হয়েছে';
-              saveStore(store);
-            }
+            mutateStore((s) => {
+              const existing = s.groups.find((g) => g.chatId === String(chat.id));
+              if (existing) {
+                existing.enabled = false;
+                existing.lastError = 'বটটি গ্রুপ থেকে রিমুভ করা হয়েছে';
+              }
+            });
           }
         }
       }
@@ -787,7 +790,9 @@ async function pollTelegramUpdates(): Promise<void> {
     }
 
     if (updates.length > 0) {
-      saveStore(store);
+      mutateStore((s) => {
+        s.updateOffset = Math.max(s.updateOffset, nextOffset);
+      });
     }
   } catch (err) {
     botStatus.lastPollError = err instanceof Error ? err.message : 'Polling error';
@@ -923,14 +928,16 @@ async function sendProductToGroup(
 
 // ---------- BROADCAST & SCHEDULER ----------
 
-function addLog(entry: Omit<PostLog, 'id' | 'timestamp'>): void {
-  store.logs.unshift({
+let stopRequested = false;
+
+function addLogToStore(targetStore: StoreData, entry: Omit<PostLog, 'id' | 'timestamp'>): void {
+  targetStore.logs.unshift({
     id: `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
     timestamp: new Date().toISOString(),
     ...entry,
   });
-  if (store.logs.length > 200) {
-    store.logs = store.logs.slice(0, 200);
+  if (targetStore.logs.length > 200) {
+    targetStore.logs = targetStore.logs.slice(0, 200);
   }
 }
 
@@ -955,12 +962,62 @@ function selectProductsForRound(specificProductId?: string): ProductItem[] {
   }
 
   const idx = store.config.rotationIndex % activeProducts.length;
-  store.config.rotationIndex = (idx + 1) % activeProducts.length;
+  mutateStore((s) => {
+    const freshActive = s.products.filter((p) => p.active);
+    if (freshActive.length > 0) {
+      s.config.rotationIndex = (idx + 1) % freshActive.length;
+    }
+  });
   return [activeProducts[idx]];
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sleepInterruptible(ms: number, isScheduled: boolean, productId: string): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    await sleep(Math.min(1000, Math.max(50, deadline - Date.now())));
+    if (isScheduled) {
+      reloadStoreFromDisk();
+      if (!store.config.enabled || stopRequested) {
+        return false;
+      }
+      if (!store.products.some((p) => p.id === productId && p.active)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function tryAcquireSchedulerLock(): boolean {
+  try {
+    if (fs.existsSync(SCHEDULER_LOCK_FILE)) {
+      const stat = fs.statSync(SCHEDULER_LOCK_FILE);
+      // Recover stale lock older than 5 minutes
+      if (Date.now() - stat.mtimeMs > 5 * 60 * 1000) {
+        fs.unlinkSync(SCHEDULER_LOCK_FILE);
+      }
+    }
+    const fd = fs.openSync(SCHEDULER_LOCK_FILE, 'wx');
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf-8');
+    fs.closeSync(fd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseSchedulerLock(): void {
+  try {
+    if (fs.existsSync(SCHEDULER_LOCK_FILE)) {
+      fs.unlinkSync(SCHEDULER_LOCK_FILE);
+    }
+  } catch {
+    // ignore cleanup error
+  }
 }
 
 async function executeBroadcastRound(options?: {
@@ -971,6 +1028,12 @@ async function executeBroadcastRound(options?: {
 }): Promise<{ sent: number; failed: number; dryRunCount: number; error?: string }> {
   if (isBroadcasting) {
     return { sent: 0, failed: 0, dryRunCount: 0, error: 'একটি ব্রডকাস্ট ইতোমধ্যে চলছে' };
+  }
+
+  reloadStoreFromDisk();
+  const isScheduled = Boolean(options?.isScheduled);
+  if (isScheduled && (!store.config.enabled || stopRequested)) {
+    return { sent: 0, failed: 0, dryRunCount: 0 };
   }
 
   const targetGroups = options?.groupId
@@ -988,7 +1051,14 @@ async function executeBroadcastRound(options?: {
 
   const chosenProducts = selectProductsForRound(options?.productId);
   if (chosenProducts.length === 0) {
-    return { sent: 0, failed: 0, dryRunCount: 0, error: 'কোনো সক্রিয় প্রোডাক্ট পাওয়া যায়নি' };
+    if (store.config.enabled) {
+      mutateStore((s) => {
+        if (s.products.filter((p) => p.active).length === 0) {
+          s.config.enabled = false;
+        }
+      });
+    }
+    return { sent: 0, failed: 0, dryRunCount: 0, error: 'কোনো সক্রিয় পোস্ট পাওয়া যায়নি' };
   }
 
   const dryRun = Boolean(options?.dryRun);
@@ -1017,82 +1087,113 @@ async function executeBroadcastRound(options?: {
   let sent = 0;
   let failed = 0;
   let dryRunCount = 0;
+  let aborted = false;
 
   try {
     const delayMs = Math.max(1, store.config.delayBetweenGroupsSec) * 1000;
 
-    for (let pIdx = 0; pIdx < chosenProducts.length; pIdx++) {
+    for (let pIdx = 0; pIdx < chosenProducts.length && !aborted; pIdx++) {
       const product = chosenProducts[pIdx];
 
       for (let gIdx = 0; gIdx < targetGroups.length; gIdx++) {
-        const group = targetGroups[gIdx];
-        const result =
-          mode === 'userbot'
-            ? await sendProductViaUserbot(product, group, store.config, dryRun)
-            : await sendProductToGroup(product, group, store.config, dryRun);
-
-        const nowIso = new Date().toISOString();
-        if (result.ok) {
-          if (result.dryRun) {
-            dryRunCount++;
-            addLog({
-              productId: product.id,
-              productName: product.name,
-              groupId: group.id,
-              groupTitle: group.title,
-              status: 'dry_run',
-              message: 'টেস্ট সিমুলেশন সম্পন্ন (বাস্তব টেলিগ্রাম মেসেজ পাঠানো হয়নি)',
-            });
-          } else {
-            sent++;
-            product.postCount += 1;
-            product.lastPostedAt = nowIso;
-            group.postCount += 1;
-            group.lastPostedAt = nowIso;
-            group.lastError = null;
-            addLog({
-              productId: product.id,
-              productName: product.name,
-              groupId: group.id,
-              groupTitle: group.title,
-              status: 'success',
-              message:
-                mode === 'userbot'
-                  ? 'পার্সোনাল অ্যাকাউন্ট থেকে সফলভাবে পোস্ট হয়েছে'
-                  : 'বটের মাধ্যমে সফলভাবে পোস্ট হয়েছে',
-              telegramMessageId: result.messageId,
-            });
-          }
-        } else {
-          failed++;
-          group.lastError = result.error ?? 'Unknown error';
-          addLog({
-            productId: product.id,
-            productName: product.name,
-            groupId: group.id,
-            groupTitle: group.title,
-            status: 'error',
-            message: result.error ?? 'পোস্ট ব্যর্থ হয়েছে',
-          });
+        // Re-verify fresh state from disk before every single Telegram send
+        reloadStoreFromDisk();
+        if (isScheduled && (!store.config.enabled || stopRequested)) {
+          aborted = true;
+          break;
+        }
+        const liveProduct = store.products.find((p) => p.id === product.id);
+        if (!liveProduct || (isScheduled && !liveProduct.active)) {
+          aborted = true;
+          break;
         }
 
-        saveStore(store);
+        const group = targetGroups[gIdx];
+        const liveGroup = store.groups.find((g) => g.id === group.id);
+        if (!liveGroup) {
+          continue;
+        }
+
+        const result =
+          mode === 'userbot'
+            ? await sendProductViaUserbot(liveProduct, liveGroup, store.config, dryRun)
+            : await sendProductToGroup(liveProduct, liveGroup, store.config, dryRun);
+
+        const nowIso = new Date().toISOString();
+        mutateStore((s) => {
+          const targetProd = s.products.find((p) => p.id === liveProduct.id);
+          const targetGrp = s.groups.find((g) => g.id === liveGroup.id);
+
+          if (result.ok) {
+            if (result.dryRun) {
+              dryRunCount++;
+              addLogToStore(s, {
+                productId: liveProduct.id,
+                productName: liveProduct.name,
+                groupId: liveGroup.id,
+                groupTitle: liveGroup.title,
+                status: 'dry_run',
+                message: 'টেস্ট সিমুলেশন সম্পন্ন (বাস্তব টেলিগ্রাম মেসেজ পাঠানো হয়নি)',
+              });
+            } else {
+              sent++;
+              if (targetProd) {
+                targetProd.postCount += 1;
+                targetProd.lastPostedAt = nowIso;
+              }
+              if (targetGrp) {
+                targetGrp.postCount += 1;
+                targetGrp.lastPostedAt = nowIso;
+                targetGrp.lastError = null;
+              }
+              addLogToStore(s, {
+                productId: liveProduct.id,
+                productName: liveProduct.name,
+                groupId: liveGroup.id,
+                groupTitle: liveGroup.title,
+                status: 'success',
+                message:
+                  mode === 'userbot'
+                    ? 'পার্সোনাল অ্যাকাউন্ট থেকে সফলভাবে পোস্ট হয়েছে'
+                    : 'বটের মাধ্যমে সফলভাবে পোস্ট হয়েছে',
+                telegramMessageId: result.messageId,
+              });
+            }
+          } else {
+            failed++;
+            if (targetGrp) {
+              targetGrp.lastError = result.error ?? 'Unknown error';
+            }
+            addLogToStore(s, {
+              productId: liveProduct.id,
+              productName: liveProduct.name,
+              groupId: liveGroup.id,
+              groupTitle: liveGroup.title,
+              status: 'error',
+              message: result.error ?? 'পোস্ট ব্যর্থ হয়েছে',
+            });
+          }
+        });
 
         const hasMore = gIdx < targetGroups.length - 1 || pIdx < chosenProducts.length - 1;
         if (hasMore && !dryRun) {
-          // Add slight +/-2s natural jitter in userbot mode
           const jitter = mode === 'userbot' ? Math.floor(Math.random() * 3000) : 0;
-          await sleep(delayMs + jitter);
+          const keepGoing = await sleepInterruptible(delayMs + jitter, isScheduled, product.id);
+          if (!keepGoing) {
+            aborted = true;
+            break;
+          }
         }
       }
     }
 
     const now = Date.now();
-    store.config.lastRunAt = new Date(now).toISOString();
-    if (store.config.enabled || options?.isScheduled) {
-      store.config.nextRunAt = new Date(now + store.config.intervalMinutes * 60 * 1000).toISOString();
-    }
-    saveStore(store);
+    mutateStore((s) => {
+      s.config.lastRunAt = new Date(now).toISOString();
+      if (s.config.enabled) {
+        s.config.nextRunAt = new Date(now + s.config.intervalMinutes * 60 * 1000).toISOString();
+      }
+    });
     return { sent, failed, dryRunCount };
   } finally {
     isBroadcasting = false;
@@ -1122,33 +1223,59 @@ function isWithinActiveHours(config: SchedulerConfig): boolean {
 }
 
 async function schedulerTick(): Promise<void> {
-  if (!store.config.enabled || isBroadcasting) {
+  if (isBroadcasting || stopRequested) {
     return;
   }
-  if (store.config.postingMode === 'userbot' && (!userClient || !userbotStatus.connected)) {
+  if (!tryAcquireSchedulerLock()) {
     return;
   }
-  if (store.config.postingMode === 'bot' && !getToken()) {
-    return;
-  }
-
-  const now = Date.now();
-  const nextRunMs = store.config.nextRunAt ? Date.parse(store.config.nextRunAt) : 0;
-
-  if (!nextRunMs) {
-    store.config.nextRunAt = new Date(now + store.config.intervalMinutes * 60 * 1000).toISOString();
-    saveStore(store);
-    return;
-  }
-
-  if (now >= nextRunMs) {
-    if (!isWithinActiveHours(store.config)) {
-      store.config.nextRunAt = new Date(now + 15 * 60 * 1000).toISOString();
-      saveStore(store);
+  try {
+    reloadStoreFromDisk();
+    if (!store.config.enabled || stopRequested) {
+      return;
+    }
+    if (store.products.filter((p) => p.active).length === 0) {
+      mutateStore((s) => {
+        if (s.products.filter((p) => p.active).length === 0) {
+          s.config.enabled = false;
+        }
+      });
+      return;
+    }
+    if (store.config.postingMode === 'userbot' && (!userClient || !userbotStatus.connected)) {
+      return;
+    }
+    if (store.config.postingMode === 'bot' && !getToken()) {
       return;
     }
 
-    await executeBroadcastRound({ isScheduled: true });
+    const now = Date.now();
+    const nextRunMs = store.config.nextRunAt ? Date.parse(store.config.nextRunAt) : 0;
+
+    if (!nextRunMs) {
+      mutateStore((s) => {
+        s.config.nextRunAt = new Date(now + s.config.intervalMinutes * 60 * 1000).toISOString();
+      });
+      return;
+    }
+
+    if (now >= nextRunMs) {
+      if (!isWithinActiveHours(store.config)) {
+        mutateStore((s) => {
+          s.config.nextRunAt = new Date(now + 15 * 60 * 1000).toISOString();
+        });
+        return;
+      }
+
+      // Advance nextRunAt on disk BEFORE broadcasting so concurrent workers/cron never double-send
+      mutateStore((s) => {
+        s.config.nextRunAt = new Date(now + s.config.intervalMinutes * 60 * 1000).toISOString();
+      });
+
+      await executeBroadcastRound({ isScheduled: true });
+    }
+  } finally {
+    releaseSchedulerLock();
   }
 }
 
@@ -1252,9 +1379,10 @@ async function startServer(): Promise<void> {
       return;
     }
     const salt = crypto.randomBytes(16).toString('hex');
-    store.adminPasswordSalt = salt;
-    store.adminPasswordHash = hashPasswordWithSalt(newPwd, salt);
-    saveStore(store);
+    mutateStore((s) => {
+      s.adminPasswordSalt = salt;
+      s.adminPasswordHash = hashPasswordWithSalt(newPwd, salt);
+    });
     res.json({ ok: true, token: createAuthToken() });
   });
 
@@ -1281,6 +1409,7 @@ async function startServer(): Promise<void> {
   });
 
   app.get('/api/state', (_req, res) => {
+    reloadStoreFromDisk();
     userbotStatus.apiConfigured = getApiCredentials().configured;
     botStatus.tokenConfigured = Boolean(getToken());
     const payload: AppStateResponse = {
@@ -1374,8 +1503,10 @@ async function startServer(): Promise<void> {
         })
       );
 
-      store.userSessionString = String(client.session.save());
-      saveStore(store);
+      const savedSession = String(client.session.save());
+      mutateStore((s) => {
+        s.userSessionString = savedSession;
+      });
 
       const me = (await client.getMe()) as Api.User;
       userClient = client;
@@ -1430,8 +1561,10 @@ async function startServer(): Promise<void> {
       const passwordSrp = await tgPassword.computeCheck(passwordInfo, pwd);
       await client.invoke(new Api.auth.CheckPassword({ password: passwordSrp }));
 
-      store.userSessionString = String(client.session.save());
-      saveStore(store);
+      const savedSession = String(client.session.save());
+      mutateStore((s) => {
+        s.userSessionString = savedSession;
+      });
 
       const me = (await client.getMe()) as Api.User;
       userClient = client;
@@ -1483,8 +1616,9 @@ async function startServer(): Promise<void> {
     }
     userClient = null;
     pendingUserAuth = null;
-    store.userSessionString = '';
-    saveStore(store);
+    mutateStore((s) => {
+      s.userSessionString = '';
+    });
     userbotStatus = {
       apiConfigured: getApiCredentials().configured,
       connected: false,
@@ -1526,54 +1660,69 @@ async function startServer(): Promise<void> {
       createdAt: new Date().toISOString(),
     };
 
-    store.products.unshift(created);
-    saveStore(store);
+    mutateStore((s) => {
+      s.products.unshift(created);
+    });
     res.status(201).json(created);
   });
 
   app.put('/api/products/:id', (req, res) => {
-    const idx = store.products.findIndex((p) => p.id === req.params.id);
-    if (idx === -1) {
+    const body = req.body as Partial<ProductItem>;
+    const updatedResult = mutateStore<ProductItem | null>((s) => {
+      const idx = s.products.findIndex((p) => p.id === req.params.id);
+      if (idx === -1) return null;
+      const existing = s.products[idx];
+      const savedImages = Array.isArray(body.images) ? saveBase64Images(body.images) : existing.images;
+      const nextCaption = body.caption !== undefined ? body.caption.trim() : existing.caption;
+      const firstLine = nextCaption.split('\n').find((l) => l.trim().length > 0)?.trim() ?? existing.name;
+      const nextName =
+        body.name !== undefined
+          ? body.name.trim() || (firstLine.length > 52 ? `${firstLine.slice(0, 52)}...` : firstLine)
+          : body.caption !== undefined
+          ? firstLine.length > 52
+            ? `${firstLine.slice(0, 52)}...`
+            : firstLine
+          : existing.name;
+
+      const updated: ProductItem = {
+        ...existing,
+        name: nextName,
+        caption: nextCaption,
+        link: body.link !== undefined ? body.link.trim() || undefined : existing.link,
+        images: savedImages,
+        active: body.active !== undefined ? Boolean(body.active) : existing.active,
+      };
+      s.products[idx] = updated;
+      if (s.products.filter((p) => p.active).length === 0) {
+        s.config.enabled = false;
+        stopRequested = true;
+      }
+      return updated;
+    });
+
+    if (!updatedResult) {
       res.status(404).json({ error: 'পোস্ট পাওয়া যায়নি' });
       return;
     }
-
-    const body = req.body as Partial<ProductItem>;
-    const existing = store.products[idx];
-    const savedImages = Array.isArray(body.images) ? saveBase64Images(body.images) : existing.images;
-    const nextCaption = body.caption !== undefined ? body.caption.trim() : existing.caption;
-    const firstLine = nextCaption.split('\n').find((l) => l.trim().length > 0)?.trim() ?? existing.name;
-    const nextName =
-      body.name !== undefined
-        ? body.name.trim() || (firstLine.length > 52 ? `${firstLine.slice(0, 52)}...` : firstLine)
-        : body.caption !== undefined
-        ? firstLine.length > 52
-          ? `${firstLine.slice(0, 52)}...`
-          : firstLine
-        : existing.name;
-
-    const updated: ProductItem = {
-      ...existing,
-      name: nextName,
-      caption: nextCaption,
-      link: body.link !== undefined ? body.link.trim() || undefined : existing.link,
-      images: savedImages,
-      active: body.active !== undefined ? Boolean(body.active) : existing.active,
-    };
-
-    store.products[idx] = updated;
-    saveStore(store);
-    res.json(updated);
+    res.json(updatedResult);
   });
 
   app.delete('/api/products/:id', (req, res) => {
-    const before = store.products.length;
-    store.products = store.products.filter((p) => p.id !== req.params.id);
-    if (store.products.length === before) {
+    const deleted = mutateStore((s) => {
+      const before = s.products.length;
+      s.products = s.products.filter((p) => p.id !== req.params.id);
+      if (s.products.length === before) return false;
+      if (s.products.filter((p) => p.active).length === 0) {
+        s.config.enabled = false;
+        stopRequested = true;
+      }
+      return true;
+    });
+
+    if (!deleted) {
       res.status(404).json({ error: 'প্রোডাক্ট পাওয়া যায়নি' });
       return;
     }
-    saveStore(store);
     res.json({ ok: true });
   });
 
@@ -1627,52 +1776,57 @@ async function startServer(): Promise<void> {
       }
     }
 
-    const existing = store.groups.find((g) => g.chatId === resolvedChatId);
-    if (existing) {
-      existing.title = resolvedTitle;
-      existing.username = resolvedUsername ?? existing.username;
-      existing.type = resolvedType;
-      existing.lastError = lastError;
-      saveStore(store);
-      res.json(existing);
-      return;
-    }
+    const createdOrUpdated = mutateStore<{ created: boolean; group: TelegramGroup }>((s) => {
+      const existing = s.groups.find((g) => g.chatId === resolvedChatId);
+      if (existing) {
+        existing.title = resolvedTitle;
+        existing.username = resolvedUsername ?? existing.username;
+        existing.type = resolvedType;
+        existing.lastError = lastError;
+        return { created: false, group: existing };
+      }
 
-    const created: TelegramGroup = {
-      id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-      chatId: resolvedChatId,
-      title: resolvedTitle,
-      username: resolvedUsername,
-      type: resolvedType,
-      enabled: true,
-      postCount: 0,
-      lastPostedAt: null,
-      lastError,
-      addedVia: 'manual',
-      addedAt: new Date().toISOString(),
-    };
+      const created: TelegramGroup = {
+        id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        chatId: resolvedChatId,
+        title: resolvedTitle,
+        username: resolvedUsername,
+        type: resolvedType,
+        enabled: true,
+        postCount: 0,
+        lastPostedAt: null,
+        lastError,
+        addedVia: 'manual',
+        addedAt: new Date().toISOString(),
+      };
 
-    store.groups.unshift(created);
-    saveStore(store);
-    res.status(201).json(created);
+      s.groups.unshift(created);
+      return { created: true, group: created };
+    });
+
+    res.status(createdOrUpdated.created ? 201 : 200).json(createdOrUpdated.group);
   });
 
   app.put('/api/groups/:id', (req, res) => {
-    const group = store.groups.find((g) => g.id === req.params.id);
-    if (!group) {
+    const body = req.body as Partial<TelegramGroup>;
+    const updatedGroup = mutateStore<TelegramGroup | null>((s) => {
+      const group = s.groups.find((g) => g.id === req.params.id);
+      if (!group) return null;
+      if (body.enabled !== undefined) group.enabled = Boolean(body.enabled);
+      if (body.title !== undefined) group.title = body.title.trim() || group.title;
+      return group;
+    });
+    if (!updatedGroup) {
       res.status(404).json({ error: 'গ্রুপ পাওয়া যায়নি' });
       return;
     }
-    const body = req.body as Partial<TelegramGroup>;
-    if (body.enabled !== undefined) group.enabled = Boolean(body.enabled);
-    if (body.title !== undefined) group.title = body.title.trim() || group.title;
-    saveStore(store);
-    res.json(group);
+    res.json(updatedGroup);
   });
 
   app.delete('/api/groups/:id', (req, res) => {
-    store.groups = store.groups.filter((g) => g.id !== req.params.id);
-    saveStore(store);
+    mutateStore((s) => {
+      s.groups = s.groups.filter((g) => g.id !== req.params.id);
+    });
     res.json({ ok: true });
   });
 
@@ -1693,34 +1847,61 @@ async function startServer(): Promise<void> {
 
   app.put('/api/config', (req, res) => {
     const body = req.body as Partial<SchedulerConfig>;
-    const prevEnabled = store.config.enabled;
-    const prevInterval = store.config.intervalMinutes;
+    const result = mutateStore<{ error?: string; config: SchedulerConfig }>((s) => {
+      const prevEnabled = s.config.enabled;
+      const prevInterval = s.config.intervalMinutes;
+      const activeCount = s.products.filter((p) => p.active).length;
 
-    store.config = {
-      ...store.config,
-      ...body,
-      postingMode: body.postingMode === 'bot' ? 'bot' : body.postingMode === 'userbot' ? 'userbot' : store.config.postingMode,
-      intervalMinutes: Math.max(5, Number(body.intervalMinutes ?? store.config.intervalMinutes) || 150),
-      delayBetweenGroupsSec: Math.max(
-        1,
-        Math.min(180, Number(body.delayBetweenGroupsSec ?? store.config.delayBetweenGroupsSec) || 15)
-      ),
-      activeStartHour: Math.max(0, Math.min(23, Number(body.activeStartHour ?? store.config.activeStartHour))),
-      activeEndHour: Math.max(0, Math.min(23, Number(body.activeEndHour ?? store.config.activeEndHour))),
-    };
+      if (body.enabled === true && activeCount === 0) {
+        s.config.enabled = false;
+        stopRequested = true;
+        return {
+          error: 'কোনো সক্রিয় পোস্ট তৈরি করা নেই! আগে "পোস্ট" ট্যাব থেকে অন্তত ১টি পোস্ট তৈরি করুন, তারপর Start দিন।',
+          config: s.config,
+        };
+      }
 
-    if (
-      (!prevEnabled && store.config.enabled) ||
-      prevInterval !== store.config.intervalMinutes ||
-      !store.config.nextRunAt
-    ) {
-      store.config.nextRunAt = new Date(
-        Date.now() + store.config.intervalMinutes * 60 * 1000
-      ).toISOString();
+      s.config = {
+        ...s.config,
+        ...body,
+        postingMode: body.postingMode === 'bot' ? 'bot' : body.postingMode === 'userbot' ? 'userbot' : s.config.postingMode,
+        intervalMinutes: Math.max(5, Number(body.intervalMinutes ?? s.config.intervalMinutes) || 150),
+        delayBetweenGroupsSec: Math.max(
+          1,
+          Math.min(180, Number(body.delayBetweenGroupsSec ?? s.config.delayBetweenGroupsSec) || 15)
+        ),
+        activeStartHour: Math.max(0, Math.min(23, Number(body.activeStartHour ?? s.config.activeStartHour))),
+        activeEndHour: Math.max(0, Math.min(23, Number(body.activeEndHour ?? s.config.activeEndHour))),
+      };
+
+      if (s.config.enabled && activeCount === 0) {
+        s.config.enabled = false;
+      }
+
+      if (!s.config.enabled) {
+        stopRequested = true;
+      } else {
+        stopRequested = false;
+      }
+
+      if (
+        (!prevEnabled && s.config.enabled) ||
+        prevInterval !== s.config.intervalMinutes ||
+        !s.config.nextRunAt
+      ) {
+        s.config.nextRunAt = new Date(
+          Date.now() + s.config.intervalMinutes * 60 * 1000
+        ).toISOString();
+      }
+
+      return { config: s.config };
+    });
+
+    if (result.error) {
+      res.status(400).json({ error: result.error, config: result.config });
+      return;
     }
-
-    saveStore(store);
-    res.json(store.config);
+    res.json(result.config);
   });
 
   app.post('/api/broadcast/now', async (req, res) => {
@@ -1740,12 +1921,14 @@ async function startServer(): Promise<void> {
   });
 
   app.delete('/api/logs', (_req, res) => {
-    store.logs = [];
-    saveStore(store);
+    mutateStore((s) => {
+      s.logs = [];
+    });
     res.json({ ok: true });
   });
 
   app.get('/api/health', (_req, res) => {
+    reloadStoreFromDisk();
     res.json({
       ok: true,
       schedulerEnabled: store.config.enabled,
@@ -2022,6 +2205,9 @@ async function startServer(): Promise<void> {
       const html = rawHtml
         .replace('</head>', `    <script>window.__APP_BASE__=${JSON.stringify(basePath)};</script>\n  </head>`)
         .replaceAll('"/assets/', `"${assetPrefix}`);
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
       res.type('html').send(html);
     });
   }

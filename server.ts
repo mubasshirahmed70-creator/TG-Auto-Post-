@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import https from 'node:https';
+import { execFile } from 'node:child_process';
 import { TelegramClient, Api, sessions, password as tgPassword } from 'telegram';
 import type {
   AppStateResponse,
@@ -1761,6 +1762,241 @@ async function startServer(): Promise<void> {
       schedulerEnabled: store.config.enabled,
       nextRunAt: store.config.nextRunAt,
       lastRunAt: store.config.lastRunAt,
+    });
+  });
+
+  // ---------- BUILT-IN CODE EDITOR & SMART PATCHER API ----------
+  const EDITOR_ROOT = path.resolve('.');
+  const EDITOR_ROOT_ALLOWLIST = [
+    'server.ts',
+    'index.html',
+    'package.json',
+    'build-cpanel.mjs',
+    'cpanel-start.cjs',
+    'vite.config.ts',
+    'tsconfig.json',
+    'metadata.json',
+  ];
+  const EDITOR_ALLOWED_EXTS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.html', '.css', '.json', '.txt']);
+
+  function listEditableFiles(): Array<{
+    path: string;
+    label: string;
+    size: number;
+    modified: string;
+    hasBackup: boolean;
+  }> {
+    const results: Array<{
+      path: string;
+      label: string;
+      size: number;
+      modified: string;
+      hasBackup: boolean;
+    }> = [];
+    const seen = new Set<string>();
+
+    const addRelFile = (relPosix: string) => {
+      if (seen.has(relPosix) || relPosix.endsWith('.bak')) return;
+      const abs = path.join(EDITOR_ROOT, relPosix);
+      if (!fs.existsSync(abs)) return;
+      const stat = fs.statSync(abs);
+      if (!stat.isFile()) return;
+      seen.add(relPosix);
+      results.push({
+        path: relPosix,
+        label: relPosix,
+        size: stat.size,
+        modified: stat.mtime.toISOString().slice(0, 19).replace('T', ' '),
+        hasBackup: fs.existsSync(`${abs}.bak`),
+      });
+    };
+
+    for (const rootFile of EDITOR_ROOT_ALLOWLIST) {
+      addRelFile(rootFile);
+    }
+
+    const srcDir = path.join(EDITOR_ROOT, 'src');
+    const walkSrc = (dir: string, prefix: string) => {
+      if (!fs.existsSync(dir)) return;
+      const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        if (entry.name.startsWith('.') || entry.name.endsWith('.bak')) continue;
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walkSrc(full, rel);
+        } else if (entry.isFile()) {
+          const ext = path.extname(entry.name).toLowerCase();
+          if (EDITOR_ALLOWED_EXTS.has(ext)) {
+            addRelFile(rel);
+          }
+        }
+      }
+    };
+    walkSrc(srcDir, 'src');
+
+    return results;
+  }
+
+  function resolveEditableFilePath(relInput: unknown): { relPath: string; absPath: string } | null {
+    const raw = String(relInput ?? '').trim().replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!raw || raw.includes('..') || raw.endsWith('.bak')) return null;
+    if (
+      raw.startsWith('.env') ||
+      raw.startsWith('data/') ||
+      raw.startsWith('node_modules/') ||
+      raw.startsWith('dist/')
+    ) {
+      return null;
+    }
+    const allowed = listEditableFiles().some((f) => f.path === raw);
+    if (!allowed) return null;
+    const absPath = path.resolve(EDITOR_ROOT, raw);
+    if (!absPath.startsWith(EDITOR_ROOT + path.sep)) return null;
+    return { relPath: raw, absPath };
+  }
+
+  app.get('/api/editor/files', (_req, res) => {
+    res.json({ files: listEditableFiles() });
+  });
+
+  app.post('/api/editor/load', (req, res) => {
+    const resolved = resolveEditableFilePath((req.body as { filename?: string }).filename);
+    if (!resolved) {
+      res.status(400).json({ error: 'এই ফাইলটি এডিট করার অনুমতি নেই' });
+      return;
+    }
+    const content = fs.readFileSync(resolved.absPath, 'utf8');
+    const stat = fs.statSync(resolved.absPath);
+    res.json({
+      filename: resolved.relPath,
+      content,
+      size: `${Buffer.byteLength(content, 'utf8').toLocaleString()} bytes`,
+      modified: stat.mtime.toISOString().slice(0, 19).replace('T', ' '),
+      hasBackup: fs.existsSync(`${resolved.absPath}.bak`),
+    });
+  });
+
+  app.post('/api/editor/upload', (req, res) => {
+    const body = req.body as { filename?: string; content?: string };
+    const resolved = resolveEditableFilePath(body.filename);
+    if (!resolved) {
+      res.status(400).json({ error: 'সঠিক টার্গেট ফাইল সিলেক্ট করুন' });
+      return;
+    }
+    const content = typeof body.content === 'string' ? body.content : '';
+    if (content.trim().length < 5) {
+      res.status(400).json({ error: 'আপলোড করা ফাইলটি খালি' });
+      return;
+    }
+    fs.copyFileSync(resolved.absPath, `${resolved.absPath}.bak`);
+    fs.writeFileSync(resolved.absPath, content, 'utf8');
+    res.json({
+      ok: true,
+      message: `${resolved.relPath} সফলভাবে রিপ্লেস হয়েছে (${Buffer.byteLength(content, 'utf8').toLocaleString()} bytes)`,
+    });
+  });
+
+  app.post('/api/editor/find-replace', (req, res) => {
+    const body = req.body as { filename?: string; findText?: string; replaceText?: string };
+    const resolved = resolveEditableFilePath(body.filename);
+    if (!resolved) {
+      res.status(400).json({ error: 'সঠিক ফাইল সিলেক্ট করুন' });
+      return;
+    }
+    const findRaw = String(body.findText ?? '');
+    const replaceRaw = String(body.replaceText ?? '');
+    if (!findRaw.trim()) {
+      res.status(400).json({ error: 'খুঁজে বের করার জন্য পুরোনো কোড লিখুন' });
+      return;
+    }
+
+    const normContent = fs.readFileSync(resolved.absPath, 'utf8').replace(/\r\n/g, '\n');
+    const normFind = findRaw.replace(/\r\n/g, '\n');
+    const normReplace = replaceRaw.replace(/\r\n/g, '\n');
+
+    const parts = normContent.split(normFind);
+    const count = parts.length - 1;
+    if (count === 0) {
+      res.status(400).json({ error: `${resolved.relPath} ফাইলে হুবহু এই কোড পাওয়া যায়নি` });
+      return;
+    }
+
+    const updated = parts.join(normReplace);
+    fs.copyFileSync(resolved.absPath, `${resolved.absPath}.bak`);
+    fs.writeFileSync(resolved.absPath, updated, 'utf8');
+    res.json({
+      ok: true,
+      count,
+      message: `${resolved.relPath}-এ ${count}টি অংশ রিপ্লেস ও সেভ হয়েছে!`,
+      content: updated,
+    });
+  });
+
+  app.post('/api/editor/save', (req, res) => {
+    const body = req.body as { filename?: string; content?: string };
+    const resolved = resolveEditableFilePath(body.filename);
+    if (!resolved) {
+      res.status(400).json({ error: 'সঠিক ফাইল সিলেক্ট করুন' });
+      return;
+    }
+    const content = typeof body.content === 'string' ? body.content : '';
+    if (content.trim().length < 5) {
+      res.status(400).json({ error: 'কোড খালি রাখা যাবে না' });
+      return;
+    }
+    fs.copyFileSync(resolved.absPath, `${resolved.absPath}.bak`);
+    fs.writeFileSync(resolved.absPath, content, 'utf8');
+    res.json({
+      ok: true,
+      message: `${resolved.relPath} সেভ হয়েছে (${Buffer.byteLength(content, 'utf8').toLocaleString()} bytes)`,
+    });
+  });
+
+  app.post('/api/editor/restore', (req, res) => {
+    const resolved = resolveEditableFilePath((req.body as { filename?: string }).filename);
+    if (!resolved) {
+      res.status(400).json({ error: 'সঠিক ফাইল সিলেক্ট করুন' });
+      return;
+    }
+    const bakPath = `${resolved.absPath}.bak`;
+    if (!fs.existsSync(bakPath)) {
+      res.status(404).json({ error: 'এই ফাইলের কোনো ব্যাকআপ নেই' });
+      return;
+    }
+    fs.copyFileSync(bakPath, resolved.absPath);
+    res.json({ ok: true, message: `${resolved.relPath} আগের ব্যাকআপ থেকে রিস্টোর হয়েছে!` });
+  });
+
+  app.get('/api/editor/export-txt', (_req, res) => {
+    const allFiles = listEditableFiles();
+    const chunks: string[] = [];
+    for (const f of allFiles) {
+      const abs = path.join(EDITOR_ROOT, f.path);
+      if (!fs.existsSync(abs)) continue;
+      chunks.push(`--- START OF FILE ${f.path} ---\n\n${fs.readFileSync(abs, 'utf8')}\n\n`);
+    }
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="BazarBot_All_Files.txt"');
+    res.send(chunks.join(''));
+  });
+
+  app.post('/api/editor/rebuild', (_req, res) => {
+    const buildScript = path.join(EDITOR_ROOT, 'build-cpanel.mjs');
+    if (!fs.existsSync(buildScript)) {
+      res.status(404).json({ error: 'build-cpanel.mjs পাওয়া যায়নি' });
+      return;
+    }
+    execFile(process.execPath, [buildScript], { cwd: EDITOR_ROOT, timeout: 60000 }, (err, stdout, stderr) => {
+      if (err) {
+        res.status(500).json({ error: stderr || err.message || 'বিল্ড ব্যর্থ হয়েছে' });
+        return;
+      }
+      res.json({
+        ok: true,
+        message: 'অ্যাপ সফলভাবে Rebuild হয়েছে! পরিবর্তন দেখতে পেজ রিফ্রেশ দিন।',
+        output: stdout.trim(),
+      });
     });
   });
 

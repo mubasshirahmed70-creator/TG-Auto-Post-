@@ -6,6 +6,7 @@ import type {
   UserbotStatus,
 } from '../types.ts';
 import { UserbotLoginCard } from './UserbotLoginCard.tsx';
+import { CodeEditorPanel } from './CodeEditorPanel.tsx';
 import { withBase } from '../basePath.ts';
 
 const INTERVAL_PRESETS = [
@@ -47,6 +48,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [updatingPwd, setUpdatingPwd] = useState(false);
+  const [showCodeEditor, setShowCodeEditor] = useState(false);
 
   const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -86,6 +88,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setUpdatingPwd(false);
     }
   };
+
+  if (showCodeEditor) {
+    return (
+      <CodeEditorPanel
+        authToken={authToken}
+        onBack={() => setShowCodeEditor(false)}
+        onNotify={onNotify}
+        onUnauthorized={onUnauthorized}
+      />
+    );
+  }
 
   return (
     <div className="space-y-3 max-w-4xl">
@@ -445,6 +458,40 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </button>
           </div>
         </form>
+      </div>
+
+      {/* 4. Edit Code (Built-in Code Patcher & File Updater) */}
+      <div className="ui-card">
+        <div className="ui-card-body flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <span
+              className="ui-drawer-ico"
+              style={
+                {
+                  '--accent': '#7c3aed',
+                  '--accent-soft': '#f5f3ff',
+                  '--accent-border': '#ddd6fe',
+                } as React.CSSProperties
+              }
+            >
+              <i className="ri-code-s-slash-fill" />
+            </span>
+            <div>
+              <h3 className="text-[13px] font-extrabold text-[#0f172a]">Edit Code</h3>
+              <p className="text-[11px] text-[#475569] font-medium">
+                cPanel ছাড়াই ভেতরের কোড আপলোড, Find &amp; Replace ও বিল্ড করুন
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowCodeEditor(true)}
+            className="ui-btn ui-btn-dark py-2 px-4"
+          >
+            <i className="ri-code-box-fill" />
+            Edit Code
+          </button>
+        </div>
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AppStateResponse,
   PostingMode,
@@ -266,13 +266,19 @@ export default function App() {
     }
   }, []);
 
+  const mutationSeqRef = useRef(0);
+
   const apiFetch = useCallback(
     async (url: string, options: RequestInit = {}): Promise<Response> => {
       const headers = new Headers(options.headers);
       if (authToken) {
         headers.set('Authorization', `Bearer ${authToken}`);
       }
-      const res = await fetch(withBase(url), { ...options, headers });
+      const res = await fetch(withBase(url), {
+        cache: 'no-store',
+        ...options,
+        headers,
+      });
       if (res.status === 401) {
         handleUnauthorized();
       }
@@ -366,13 +372,30 @@ export default function App() {
   const fetchState = useCallback(
     async (isInitial = false) => {
       if (authState !== 'unlocked') return;
+      const reqVersion = mutationSeqRef.current;
       try {
         const res = await apiFetch('/api/state');
         if (!res.ok) throw new Error('Failed to load state');
         const data = (await res.json()) as AppStateResponse;
+        // Ignore stale GET responses that started before a user mutation (delete/toggle/save)
+        if (!isInitial && reqVersion !== mutationSeqRef.current) {
+          return;
+        }
         setState(data);
         if (isInitial) {
           setDraftConfig(data.config);
+        } else {
+          setDraftConfig((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  enabled: data.config.enabled,
+                  nextRunAt: data.config.nextRunAt,
+                  lastRunAt: data.config.lastRunAt,
+                  rotationIndex: data.config.rotationIndex,
+                }
+              : data.config
+          );
         }
       } catch {
         if (isInitial) {
@@ -400,24 +423,52 @@ export default function App() {
   }, []);
 
   const currentConfig = draftConfig ?? state?.config ?? null;
+  const schedulerEnabled = Boolean(state?.config.enabled);
 
   const handleSaveConfig = async (override?: Partial<SchedulerConfig>) => {
     if (!currentConfig) return;
-    if (override?.enabled === true && activeProductsCount === 0) {
+    const isToggle = Boolean(override && typeof override.enabled === 'boolean');
+    if (isToggle && override?.enabled === true && activeProductsCount === 0) {
       pushToast(
         'error',
         'কোনো সক্রিয় পোস্ট তৈরি করা নেই! আগে "পোস্ট" ট্যাব থেকে অন্তত ১টি পোস্ট তৈরি করুন, তারপর Start দিন।'
       );
       return;
     }
-    const payload = { ...currentConfig, ...(override ?? {}) };
+
+    mutationSeqRef.current += 1;
     setSavingConfig(true);
     try {
-      const res = await apiFetch('/api/config', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
+      let res: Response;
+      if (isToggle) {
+        res = await apiFetch('/api/scheduler/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: Boolean(override?.enabled) }),
+        });
+      } else {
+        // Never transmit runtime enabled/nextRunAt state when saving Settings form
+        const settingsPayload = {
+          postingMode: currentConfig.postingMode,
+          intervalMinutes: currentConfig.intervalMinutes,
+          delayBetweenGroupsSec: currentConfig.delayBetweenGroupsSec,
+          activeHoursEnabled: currentConfig.activeHoursEnabled,
+          activeStartHour: currentConfig.activeStartHour,
+          activeEndHour: currentConfig.activeEndHour,
+          rotationMode: currentConfig.rotationMode,
+          sellerContactUrl: currentConfig.sellerContactUrl,
+          buttonText: currentConfig.buttonText,
+          appendFooterTag: currentConfig.appendFooterTag,
+          footerText: currentConfig.footerText,
+          ...(override ?? {}),
+        };
+        res = await apiFetch('/api/config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(settingsPayload),
+        });
+      }
+
       const raw = (await res.json()) as SchedulerConfig & { error?: string };
       if (!res.ok) {
         pushToast('error', raw.error ?? 'সেটিংস সেভ করা যায়নি');
@@ -426,10 +477,10 @@ export default function App() {
       }
       setDraftConfig(raw);
       setState((prev) => (prev ? { ...prev, config: raw } : prev));
-      if (override && typeof override.enabled === 'boolean') {
+      if (isToggle) {
         pushToast(
-          override.enabled ? 'success' : 'info',
-          override.enabled
+          raw.enabled ? 'success' : 'info',
+          raw.enabled
             ? 'সিস্টেম স্টার্ট হয়েছে — নির্ধারিত সময়ে অটো-পোস্ট চলবে'
             : 'সিস্টেম স্টপ করা হয়েছে'
         );
@@ -485,6 +536,7 @@ export default function App() {
     images: string[];
     active: boolean;
   }) => {
+    mutationSeqRef.current += 1;
     const isEdit = Boolean(payload.id);
     const url = isEdit ? `/api/products/${payload.id}` : '/api/products';
     const method = isEdit ? 'PUT' : 'POST';
@@ -503,6 +555,7 @@ export default function App() {
   };
 
   const handleToggleProductActive = async (product: ProductItem) => {
+    mutationSeqRef.current += 1;
     try {
       const res = await apiFetch(`/api/products/${product.id}`, {
         method: 'PUT',
@@ -518,9 +571,20 @@ export default function App() {
   };
 
   const handleDeleteProduct = async (id: string) => {
+    mutationSeqRef.current += 1;
     try {
       const res = await apiFetch(`/api/products/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error();
+      setState((prev) => {
+        if (!prev) return prev;
+        const remaining = prev.products.filter((p) => p.id !== id);
+        const stillHasActive = remaining.some((p) => p.active);
+        return {
+          ...prev,
+          products: remaining,
+          config: stillHasActive ? prev.config : { ...prev.config, enabled: false },
+        };
+      });
       await fetchState(false);
       pushToast('info', 'পোস্ট ডিলিট করা হয়েছে');
     } catch {
@@ -893,10 +957,10 @@ export default function App() {
                         </div>
                         <span
                           className={`ui-badge shrink-0 ${
-                            currentConfig.enabled ? 'ui-badge-ok' : 'ui-badge-neutral'
+                            schedulerEnabled ? 'ui-badge-ok' : 'ui-badge-neutral'
                           }`}
                         >
-                          {currentConfig.enabled ? 'চলমান (Start)' : 'বন্ধ (Stop)'}
+                          {schedulerEnabled ? 'চলমান (Start)' : 'বন্ধ (Stop)'}
                         </span>
                       </div>
                     </div>
@@ -923,7 +987,7 @@ export default function App() {
                 </div>
 
                 {/* 2. Big Start / Stop System Control Button */}
-                {!currentConfig.enabled && activeProductsCount === 0 && (
+                {!schedulerEnabled && activeProductsCount === 0 && (
                   <div className="p-2.5 rounded-[10px] bg-[#fffbeb] border border-[#fde68a] text-[11.5px] font-bold text-[#b45309] flex items-center gap-2">
                     <i className="ri-error-warning-fill text-sm shrink-0" />
                     <span>
@@ -934,9 +998,9 @@ export default function App() {
                 <button
                   type="button"
                   disabled={savingConfig}
-                  onClick={() => void handleSaveConfig({ enabled: !currentConfig.enabled })}
+                  onClick={() => void handleSaveConfig({ enabled: !schedulerEnabled })}
                   className={`ui-btn w-full py-3.5 text-[14.5px] font-extrabold rounded-[12px] ${
-                    currentConfig.enabled
+                    schedulerEnabled
                       ? 'ui-btn-stop'
                       : activeProductsCount === 0
                       ? 'ui-btn-outline opacity-75'
@@ -947,7 +1011,7 @@ export default function App() {
                     className={`text-lg ${
                       savingConfig
                         ? 'ri-loader-4-line animate-spin'
-                        : currentConfig.enabled
+                        : schedulerEnabled
                         ? 'ri-stop-circle-fill'
                         : 'ri-play-circle-fill'
                     }`}
@@ -955,7 +1019,7 @@ export default function App() {
                   <span>
                     {savingConfig
                       ? 'আপডেট হচ্ছে...'
-                      : currentConfig.enabled
+                      : schedulerEnabled
                       ? 'Stop — অটো-পোস্ট সিস্টেম বন্ধ করুন'
                       : activeProductsCount === 0
                       ? 'Start বন্ধ (আগে পোস্ট তৈরি করুন)'
@@ -1018,10 +1082,10 @@ export default function App() {
                     <div className="min-w-0">
                       <p className="text-[10.5px] font-bold text-[#64748b] uppercase">পরবর্তী পোস্ট</p>
                       <p className="text-lg font-extrabold text-[#0f172a] ui-mono mt-0.5 truncate">
-                        {formatCountdown(currentConfig.nextRunAt, currentConfig.enabled, nowMs)}
+                        {formatCountdown(state.config.nextRunAt, schedulerEnabled, nowMs)}
                       </p>
                       <p className="text-[10.5px] text-[#64748b] truncate mt-0.5">
-                        শেষ: {formatDateTime(currentConfig.lastRunAt)}
+                        শেষ: {formatDateTime(state.config.lastRunAt)}
                       </p>
                     </div>
                     <div className="ui-stat-ico" style={accentVars(ACCENTS.emerald)}>

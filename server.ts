@@ -19,6 +19,7 @@ import type {
 
 interface StoreData {
   products: ProductItem[];
+  deletedProductIds?: string[];
   groups: TelegramGroup[];
   config: SchedulerConfig;
   logs: PostLog[];
@@ -38,16 +39,61 @@ const PORT: number | string = rawPort
 const DATA_DIR = path.resolve('data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
+const STORE_LOCK_FILE = path.join(DATA_DIR, 'store.lock');
 const SCHEDULER_LOCK_FILE = path.join(DATA_DIR, 'scheduler.lock');
+const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'instance.lock.json');
 const GENERATED_IMAGES_DIR = path.resolve('src/assets/images');
+const INSTANCE_ID = `${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+const LOCK_SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
 
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+function withStoreLock<T>(fn: () => T): T {
+  let acquired = false;
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    try {
+      const fd = fs.openSync(STORE_LOCK_FILE, 'wx');
+      fs.writeFileSync(fd, `${process.pid}:${Date.now()}`, 'utf-8');
+      fs.closeSync(fd);
+      acquired = true;
+      break;
+    } catch {
+      try {
+        if (fs.existsSync(STORE_LOCK_FILE)) {
+          const stat = fs.statSync(STORE_LOCK_FILE);
+          if (Date.now() - stat.mtimeMs > 8000) {
+            fs.unlinkSync(STORE_LOCK_FILE);
+            continue;
+          }
+        }
+      } catch {
+        // ignore stale-check race
+      }
+      Atomics.wait(LOCK_SLEEP_BUF, 0, 0, 12);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (acquired) {
+      try {
+        if (fs.existsSync(STORE_LOCK_FILE)) {
+          fs.unlinkSync(STORE_LOCK_FILE);
+        }
+      } catch {
+        // ignore unlock error
+      }
+    }
+  }
+}
 
 function createDefaultStore(): StoreData {
   const nextRun = new Date(Date.now() + 150 * 60 * 1000).toISOString();
 
   return {
     products: [],
+    deletedProductIds: [],
     groups: [],
     config: {
       enabled: false,
@@ -73,29 +119,46 @@ function createDefaultStore(): StoreData {
   };
 }
 
+function normalizeStoreData(parsed: Partial<StoreData>): StoreData {
+  const defaults = createDefaultStore();
+  const deletedList = Array.isArray(parsed.deletedProductIds)
+    ? parsed.deletedProductIds.filter((id): id is string => typeof id === 'string').slice(-300)
+    : [];
+  const deletedSet = new Set(deletedList);
+  const products = (Array.isArray(parsed.products) ? parsed.products : []).filter(
+    (p) => p && typeof p.id === 'string' && !deletedSet.has(p.id)
+  );
+  const config: SchedulerConfig = { ...defaults.config, ...(parsed.config ?? {}) };
+  if (products.filter((p) => p.active).length === 0) {
+    config.enabled = false;
+  }
+
+  return {
+    products,
+    deletedProductIds: deletedList,
+    groups: Array.isArray(parsed.groups) ? parsed.groups : [],
+    config,
+    logs: Array.isArray(parsed.logs) ? parsed.logs : [],
+    updateOffset: typeof parsed.updateOffset === 'number' ? parsed.updateOffset : 0,
+    userSessionString: typeof parsed.userSessionString === 'string' ? parsed.userSessionString : '',
+    authSecret:
+      typeof parsed.authSecret === 'string' && parsed.authSecret.length >= 16
+        ? parsed.authSecret
+        : defaults.authSecret,
+    adminPasswordSalt:
+      typeof parsed.adminPasswordSalt === 'string' ? parsed.adminPasswordSalt : undefined,
+    adminPasswordHash:
+      typeof parsed.adminPasswordHash === 'string' ? parsed.adminPasswordHash : undefined,
+  };
+}
+
 function parseStoreFromDisk(): StoreData | null {
   try {
     if (!fs.existsSync(STORE_FILE)) return null;
     const raw = fs.readFileSync(STORE_FILE, 'utf-8');
     if (!raw.trim()) return null;
     const parsed = JSON.parse(raw) as Partial<StoreData>;
-    const defaults = createDefaultStore();
-    return {
-      products: Array.isArray(parsed.products) ? parsed.products : [],
-      groups: Array.isArray(parsed.groups) ? parsed.groups : [],
-      config: { ...defaults.config, ...(parsed.config ?? {}) },
-      logs: Array.isArray(parsed.logs) ? parsed.logs : [],
-      updateOffset: typeof parsed.updateOffset === 'number' ? parsed.updateOffset : 0,
-      userSessionString: typeof parsed.userSessionString === 'string' ? parsed.userSessionString : '',
-      authSecret:
-        typeof parsed.authSecret === 'string' && parsed.authSecret.length >= 16
-          ? parsed.authSecret
-          : defaults.authSecret,
-      adminPasswordSalt:
-        typeof parsed.adminPasswordSalt === 'string' ? parsed.adminPasswordSalt : undefined,
-      adminPasswordHash:
-        typeof parsed.adminPasswordHash === 'string' ? parsed.adminPasswordHash : undefined,
-    };
+    return normalizeStoreData(parsed);
   } catch (err) {
     console.error('Failed to read store.json:', err);
     return null;
@@ -103,25 +166,27 @@ function parseStoreFromDisk(): StoreData | null {
 }
 
 function saveStore(data: StoreData): void {
+  const normalized = normalizeStoreData(data);
   const tmpFile = `${STORE_FILE}.tmp.${process.pid}.${Date.now()}`;
-  fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
+  fs.writeFileSync(tmpFile, JSON.stringify(normalized, null, 2), 'utf-8');
   fs.renameSync(tmpFile, STORE_FILE);
 }
 
 function loadStore(): StoreData {
-  const fromDisk = parseStoreFromDisk();
-  if (fromDisk) return fromDisk;
-  const initial = createDefaultStore();
-  saveStore(initial);
-  return initial;
+  return withStoreLock(() => {
+    const fromDisk = parseStoreFromDisk();
+    if (fromDisk) return fromDisk;
+    const initial = createDefaultStore();
+    saveStore(initial);
+    return initial;
+  });
 }
 
 const store = loadStore();
 
-function reloadStoreFromDisk(): StoreData {
-  const fresh = parseStoreFromDisk();
-  if (!fresh) return store;
+function applyFreshStore(fresh: StoreData): void {
   store.products = fresh.products;
+  store.deletedProductIds = fresh.deletedProductIds;
   store.groups = fresh.groups;
   store.config = fresh.config;
   store.logs = fresh.logs;
@@ -130,14 +195,23 @@ function reloadStoreFromDisk(): StoreData {
   store.authSecret = fresh.authSecret;
   store.adminPasswordSalt = fresh.adminPasswordSalt;
   store.adminPasswordHash = fresh.adminPasswordHash;
+}
+
+function reloadStoreFromDisk(): StoreData {
+  const fresh = parseStoreFromDisk();
+  if (!fresh) return store;
+  applyFreshStore(fresh);
   return store;
 }
 
 function mutateStore<T>(mutator: (s: StoreData) => T): T {
-  reloadStoreFromDisk();
-  const result = mutator(store);
-  saveStore(store);
-  return result;
+  return withStoreLock(() => {
+    reloadStoreFromDisk();
+    const result = mutator(store);
+    saveStore(store);
+    reloadStoreFromDisk();
+    return result;
+  });
 }
 
 function getApiCredentials(): { apiId: number; apiHash: string; configured: boolean } {
@@ -708,6 +782,9 @@ function upsertGroupFromChat(
 }
 
 async function pollTelegramUpdates(): Promise<void> {
+  if (!isCurrentActiveInstance()) {
+    return;
+  }
   const token = getToken();
   if (!token) {
     botStatus.pollingActive = false;
@@ -1223,6 +1300,9 @@ function isWithinActiveHours(config: SchedulerConfig): boolean {
 }
 
 async function schedulerTick(): Promise<void> {
+  if (!isCurrentActiveInstance()) {
+    return;
+  }
   if (isBroadcasting || stopRequested) {
     return;
   }
@@ -1390,8 +1470,13 @@ async function startServer(): Promise<void> {
     res.json({ ok: true });
   });
 
-  // Protect all dashboard APIs except auth, health, and cron/tick
+  // Prevent LiteSpeed / browser / proxy caching on all API routes & protect dashboard endpoints
   app.use('/api', (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('X-LiteSpeed-Cache-Control', 'no-cache');
+
     if (
       req.path === '/health' ||
       req.path === '/cron/tick' ||
@@ -1708,22 +1793,40 @@ async function startServer(): Promise<void> {
   });
 
   app.delete('/api/products/:id', (req, res) => {
-    const deleted = mutateStore((s) => {
-      const before = s.products.length;
-      s.products = s.products.filter((p) => p.id !== req.params.id);
-      if (s.products.length === before) return false;
+    const productId = req.params.id;
+    const removedImages = mutateStore<string[] | null>((s) => {
+      const target = s.products.find((p) => p.id === productId);
+      if (!target) return null;
+      const deadImages = [...target.images];
+      s.products = s.products.filter((p) => p.id !== productId);
+      const deletedSet = new Set(s.deletedProductIds ?? []);
+      deletedSet.add(productId);
+      s.deletedProductIds = Array.from(deletedSet).slice(-300);
       if (s.products.filter((p) => p.active).length === 0) {
         s.config.enabled = false;
         stopRequested = true;
       }
-      return true;
+      const stillReferenced = new Set(s.products.flatMap((p) => p.images));
+      return deadImages.filter((img) => img.startsWith('/uploads/') && !stillReferenced.has(img));
     });
 
-    if (!deleted) {
+    if (removedImages === null) {
       res.status(404).json({ error: 'প্রোডাক্ট পাওয়া যায়নি' });
       return;
     }
-    res.json({ ok: true });
+
+    for (const imgPath of removedImages) {
+      try {
+        const diskFile = path.join(UPLOADS_DIR, path.basename(imgPath));
+        if (fs.existsSync(diskFile)) {
+          fs.unlinkSync(diskFile);
+        }
+      } catch {
+        // ignore image cleanup errors
+      }
+    }
+
+    res.json({ ok: true, schedulerEnabled: store.config.enabled });
   });
 
   // ---------- GROUP ENDPOINTS ----------
@@ -1843,7 +1946,41 @@ async function startServer(): Promise<void> {
     });
   });
 
-  // ---------- CONFIG & BROADCAST ----------
+  // ---------- CONFIG, SCHEDULER TOGGLE & BROADCAST ----------
+
+  app.post('/api/scheduler/toggle', (req, res) => {
+    const desired = Boolean((req.body as { enabled?: boolean }).enabled);
+    const result = mutateStore<{ error?: string; config: SchedulerConfig }>((s) => {
+      const activeCount = s.products.filter((p) => p.active).length;
+
+      if (desired && activeCount === 0) {
+        s.config.enabled = false;
+        stopRequested = true;
+        return {
+          error:
+            'কোনো সক্রিয় পোস্ট তৈরি করা নেই! আগে "পোস্ট" ট্যাব থেকে অন্তত ১টি পোস্ট তৈরি করুন, তারপর Start দিন।',
+          config: s.config,
+        };
+      }
+
+      s.config.enabled = desired;
+      if (!desired) {
+        stopRequested = true;
+      } else {
+        stopRequested = false;
+        s.config.nextRunAt = new Date(
+          Date.now() + s.config.intervalMinutes * 60 * 1000
+        ).toISOString();
+      }
+      return { config: s.config };
+    });
+
+    if (result.error) {
+      res.status(400).json({ error: result.error, config: result.config });
+      return;
+    }
+    res.json(result.config);
+  });
 
   app.put('/api/config', (req, res) => {
     const body = req.body as Partial<SchedulerConfig>;
@@ -1852,19 +1989,21 @@ async function startServer(): Promise<void> {
       const prevInterval = s.config.intervalMinutes;
       const activeCount = s.products.filter((p) => p.active).length;
 
-      if (body.enabled === true && activeCount === 0) {
-        s.config.enabled = false;
-        stopRequested = true;
-        return {
-          error: 'কোনো সক্রিয় পোস্ট তৈরি করা নেই! আগে "পোস্ট" ট্যাব থেকে অন্তত ১টি পোস্ট তৈরি করুন, তারপর Start দিন।',
-          config: s.config,
-        };
-      }
+      // Never allow PUT /api/config to accidentally re-enable a stopped scheduler;
+      // Start must go through POST /api/scheduler/toggle (only explicit Stop is honored here).
+      const nextEnabled =
+        body.enabled === false ? false : activeCount === 0 ? false : prevEnabled;
 
       s.config = {
         ...s.config,
         ...body,
-        postingMode: body.postingMode === 'bot' ? 'bot' : body.postingMode === 'userbot' ? 'userbot' : s.config.postingMode,
+        enabled: nextEnabled,
+        postingMode:
+          body.postingMode === 'bot'
+            ? 'bot'
+            : body.postingMode === 'userbot'
+            ? 'userbot'
+            : s.config.postingMode,
         intervalMinutes: Math.max(5, Number(body.intervalMinutes ?? s.config.intervalMinutes) || 150),
         delayBetweenGroupsSec: Math.max(
           1,
@@ -1874,21 +2013,11 @@ async function startServer(): Promise<void> {
         activeEndHour: Math.max(0, Math.min(23, Number(body.activeEndHour ?? s.config.activeEndHour))),
       };
 
-      if (s.config.enabled && activeCount === 0) {
-        s.config.enabled = false;
-      }
-
       if (!s.config.enabled) {
         stopRequested = true;
-      } else {
-        stopRequested = false;
       }
 
-      if (
-        (!prevEnabled && s.config.enabled) ||
-        prevInterval !== s.config.intervalMinutes ||
-        !s.config.nextRunAt
-      ) {
+      if (prevInterval !== s.config.intervalMinutes || !s.config.nextRunAt) {
         s.config.nextRunAt = new Date(
           Date.now() + s.config.intervalMinutes * 60 * 1000
         ).toISOString();
@@ -1897,10 +2026,6 @@ async function startServer(): Promise<void> {
       return { config: s.config };
     });
 
-    if (result.error) {
-      res.status(400).json({ error: result.error, config: result.config });
-      return;
-    }
     res.json(result.config);
   });
 
@@ -2175,6 +2300,13 @@ async function startServer(): Promise<void> {
         res.status(500).json({ error: stderr || err.message || 'বিল্ড ব্যর্থ হয়েছে' });
         return;
       }
+      try {
+        const tmpDir = path.join(EDITOR_ROOT, 'tmp');
+        fs.mkdirSync(tmpDir, { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'restart.txt'), `${Date.now()}\n`, 'utf8');
+      } catch {
+        // ignore restart hint error
+      }
       res.json({
         ok: true,
         message: 'অ্যাপ সফলভাবে Rebuild হয়েছে! পরিবর্তন দেখতে পেজ রিফ্রেশ দিন।',
@@ -2208,19 +2340,27 @@ async function startServer(): Promise<void> {
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
+      res.setHeader('X-LiteSpeed-Cache-Control', 'no-cache');
       res.type('html').send(html);
     });
   }
 
-  if (typeof PORT === 'number') {
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`BazarBot server running on http://0.0.0.0:${PORT}`);
-    });
-  } else {
-    app.listen(PORT, () => {
-      console.log(`BazarBot server listening on socket ${PORT}`);
-    });
+  // Terminate any orphaned previous BazarBot worker in this same directory before claiming lock
+  if (process.env.NODE_ENV === 'production') {
+    terminateOrphanedWorkers();
   }
+  claimActiveInstance();
+
+  const server =
+    typeof PORT === 'number'
+      ? app.listen(PORT, '0.0.0.0', () => {
+          console.log(`BazarBot server running on http://0.0.0.0:${PORT}`);
+        })
+      : app.listen(PORT, () => {
+          console.log(`BazarBot server listening on socket ${PORT}`);
+        });
+
+  activeHttpServer = server;
 
   await initUserbotClient();
   await verifyBotToken();
@@ -2228,13 +2368,149 @@ async function startServer(): Promise<void> {
     await pollTelegramUpdates();
   }
 
-  setInterval(() => {
+  pollIntervalHandle = setInterval(() => {
     void pollTelegramUpdates();
   }, 5000);
 
-  setInterval(() => {
+  schedulerIntervalHandle = setInterval(() => {
     void schedulerTick();
   }, 15000);
+}
+
+let activeHttpServer: import('node:http').Server | null = null;
+let pollIntervalHandle: ReturnType<typeof setInterval> | null = null;
+let schedulerIntervalHandle: ReturnType<typeof setInterval> | null = null;
+let isShuttingDown = false;
+
+function claimActiveInstance(): void {
+  try {
+    fs.writeFileSync(
+      INSTANCE_LOCK_FILE,
+      JSON.stringify({
+        pid: process.pid,
+        instanceId: INSTANCE_ID,
+        startedAt: new Date().toISOString(),
+      }),
+      'utf-8'
+    );
+  } catch {
+    // ignore lock write failure
+  }
+}
+
+function isCurrentActiveInstance(): boolean {
+  if (isShuttingDown) return false;
+  try {
+    if (!fs.existsSync(INSTANCE_LOCK_FILE)) return true;
+    const raw = fs.readFileSync(INSTANCE_LOCK_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as { instanceId?: string; pid?: number };
+    if (parsed.instanceId && parsed.instanceId !== INSTANCE_ID) {
+      console.log(`Detected newer BazarBot instance (${parsed.pid}); shutting down stale worker ${process.pid}.`);
+      void gracefulShutdown('superseded');
+      return false;
+    }
+  } catch {
+    // ignore parse race
+  }
+  return true;
+}
+
+function terminateOrphanedWorkers(): void {
+  const cwd = process.cwd();
+  const stalePids = new Set<number>();
+
+  try {
+    if (fs.existsSync(INSTANCE_LOCK_FILE)) {
+      const prev = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf-8')) as { pid?: number };
+      if (typeof prev.pid === 'number' && prev.pid > 1 && prev.pid !== process.pid && prev.pid !== process.ppid) {
+        stalePids.add(prev.pid);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    if (fs.existsSync('/proc')) {
+      for (const entry of fs.readdirSync('/proc')) {
+        if (!/^\d+$/.test(entry)) continue;
+        const pid = Number(entry);
+        if (pid <= 1 || pid === process.pid || pid === process.ppid) continue;
+        try {
+          const procCwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+          if (procCwd !== cwd) continue;
+          const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ');
+          if (
+            cmdline.includes('cpanel-start.cjs') ||
+            cmdline.includes('server.mjs') ||
+            cmdline.includes('server.ts')
+          ) {
+            stalePids.add(pid);
+          }
+        } catch {
+          // ignore processes we cannot inspect
+        }
+      }
+    }
+  } catch {
+    // ignore non-Linux or restricted /proc
+  }
+
+  for (const pid of stalePids) {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      // ignore ESRCH
+    }
+  }
+
+  if (stalePids.size > 0) {
+    setTimeout(() => {
+      for (const pid of stalePids) {
+        try {
+          process.kill(pid, 0);
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // already exited
+        }
+      }
+    }, 1500).unref();
+  }
+}
+
+async function gracefulShutdown(reason: string): Promise<void> {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  stopRequested = true;
+  console.log(`Shutting down BazarBot worker ${process.pid} (${reason})...`);
+
+  if (pollIntervalHandle) clearInterval(pollIntervalHandle);
+  if (schedulerIntervalHandle) clearInterval(schedulerIntervalHandle);
+
+  try {
+    if (userClient) {
+      await userClient.disconnect();
+      userClient = null;
+    }
+  } catch {
+    // ignore disconnect errors
+  }
+
+  try {
+    if (activeHttpServer) {
+      activeHttpServer.close();
+    }
+  } catch {
+    // ignore close error
+  }
+
+  setTimeout(() => process.exit(0), 250).unref();
+}
+
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGUSR2', 'SIGHUP'] as const) {
+  process.on(sig, () => {
+    void gracefulShutdown(sig);
+  });
 }
 
 void startServer();

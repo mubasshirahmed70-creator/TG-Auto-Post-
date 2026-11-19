@@ -49,6 +49,41 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [newPassword, setNewPassword] = useState('');
   const [updatingPwd, setUpdatingPwd] = useState(false);
   const [showCodeEditor, setShowCodeEditor] = useState(false);
+  const [resetScopeConfirm, setResetScopeConfirm] = useState<'posts' | 'groups' | 'all' | null>(null);
+  const [resetting, setResetting] = useState(false);
+
+  const handleConfirmReset = async () => {
+    if (!resetScopeConfirm) return;
+    const scope = resetScopeConfirm;
+    setResetting(true);
+    try {
+      const res = await fetch(withBase('/api/system/reset'), {
+        method: 'POST',
+        cache: 'no-store',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify({ scope }),
+      });
+      if (res.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      const data = (await res.json()) as { ok?: boolean; message?: string; error?: string };
+      if (!res.ok) {
+        onNotify('error', data.error ?? 'ডাটা রিসেট করা যায়নি');
+        return;
+      }
+      setResetScopeConfirm(null);
+      await onRefreshState();
+      onNotify('success', data.message ?? 'সফলভাবে রিসেট করা হয়েছে');
+    } catch {
+      onNotify('error', 'ডাটা রিসেট করতে নেটওয়ার্ক সমস্যা হয়েছে');
+    } finally {
+      setResetting(false);
+    }
+  };
 
   const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -460,7 +495,71 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </form>
       </div>
 
-      {/* 4. Edit Code (Built-in Code Patcher & File Updater) */}
+      {/* 4. Data & Session Reset (Clean Customer Handover / Full Wipe) */}
+      <div className="ui-card">
+        <div className="ui-card-head">
+          <div className="flex items-center gap-2.5">
+            <span
+              className="ui-drawer-ico"
+              style={
+                {
+                  '--accent': '#e11d48',
+                  '--accent-soft': '#fff1f2',
+                  '--accent-border': '#fecdd3',
+                } as React.CSSProperties
+              }
+            >
+              <i className="ri-delete-bin-5-fill" />
+            </span>
+            <div>
+              <h3>ডাটা ও সেশন রিসেট</h3>
+              <p className="text-[11px] text-[#475569] font-medium">
+                পুরোনো পোস্ট, গ্রুপ বা টেলিগ্রাম সেশন এক ক্লিকে মূল থেকে পরিষ্কার করুন
+              </p>
+            </div>
+          </div>
+          <span className="ui-badge ui-badge-err">রিসেট টুল</span>
+        </div>
+
+        <div className="ui-card-body space-y-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={resetting}
+              onClick={() => setResetScopeConfirm('posts')}
+              className="ui-btn ui-btn-outline"
+            >
+              <i className="ri-shopping-bag-3-line text-[#e11d48]" />
+              সব পোস্ট ও হিস্ট্রি মুছুন
+            </button>
+
+            <button
+              type="button"
+              disabled={resetting}
+              onClick={() => setResetScopeConfirm('groups')}
+              className="ui-btn ui-btn-outline"
+            >
+              <i className="ri-group-line text-[#d97706]" />
+              সব গ্রুপ মুছুন
+            </button>
+
+            <button
+              type="button"
+              disabled={resetting}
+              onClick={() => setResetScopeConfirm('all')}
+              className="ui-btn ui-btn-danger"
+            >
+              <i className="ri-refresh-line" />
+              সম্পূর্ণ ফ্যাক্টরি রিসেট (টেলিগ্রাম সেশনসহ)
+            </button>
+          </div>
+          <p className="text-[11px] text-[#64748b] leading-relaxed">
+            ফ্যাক্টরি রিসেট দিলে আপনার টেলিগ্রাম অ্যাকাউন্ট লগআউট হবে এবং সব পোস্ট, আপলোড করা ছবি, গ্রুপ ও হিস্ট্রি একদম পরিষ্কার হয়ে যাবে (ওয়েবসাইট লগইন পাসওয়ার্ড অপরিবর্তিত থাকবে)।
+          </p>
+        </div>
+      </div>
+
+      {/* 5. Edit Code (Built-in Code Patcher & File Updater) */}
       <div className="ui-card">
         <div className="ui-card-body flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
@@ -493,6 +592,59 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Custom Confirm Reset Modal */}
+      {resetScopeConfirm && (
+        <div className="ui-modal-ov show" role="dialog" aria-modal="true">
+          <div className="ui-modal max-w-[360px]">
+            <div className="ui-modal-head">
+              <h3>
+                <i className="ri-alert-fill text-[#e11d48]" />
+                নিশ্চিত করুন
+              </h3>
+              <button
+                type="button"
+                disabled={resetting}
+                onClick={() => setResetScopeConfirm(null)}
+                className="ui-btn ui-btn-outline py-1 px-2"
+              >
+                <i className="ri-close-line" />
+              </button>
+            </div>
+            <div className="p-4 text-center space-y-3">
+              <div className="w-11 h-11 rounded-[12px] bg-[#fff1f2] text-[#e11d48] border border-[#fecdd3] flex items-center justify-center text-xl mx-auto">
+                <i className="ri-delete-bin-2-fill" />
+              </div>
+              <p className="text-[12.5px] font-semibold text-[#0f172a] leading-relaxed">
+                {resetScopeConfirm === 'posts'
+                  ? 'সব পোস্ট, আপলোড করা ছবি ও পোস্ট হিস্ট্রি স্থায়ীভাবে মুছে ফেলা হবে এবং অটো-পোস্ট বন্ধ হবে।'
+                  : resetScopeConfirm === 'groups'
+                  ? 'তালিকার সব টেলিগ্রাম গ্রুপ মুছে ফেলা হবে।'
+                  : 'টেলিগ্রাম লগইন সেশন, সব পোস্ট, আপলোড করা ছবি, গ্রুপ ও হিস্ট্রি স্থায়ীভাবে মুছে একদম নতুন অবস্থায় আনা হবে।'}
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={resetting}
+                  onClick={() => setResetScopeConfirm(null)}
+                  className="ui-btn ui-btn-outline flex-1 py-2"
+                >
+                  বাতিল
+                </button>
+                <button
+                  type="button"
+                  disabled={resetting}
+                  onClick={() => void handleConfirmReset()}
+                  className="ui-btn ui-btn-stop flex-1 py-2"
+                >
+                  <i className={resetting ? 'ri-loader-4-line animate-spin' : 'ri-check-line'} />
+                  {resetting ? 'মুছে ফেলা হচ্ছে...' : 'হ্যাঁ, মুছে ফেলুন'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

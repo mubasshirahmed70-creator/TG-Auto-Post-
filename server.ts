@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import https from 'node:https';
 import { execFile } from 'node:child_process';
@@ -30,19 +31,22 @@ interface StoreData {
   adminPasswordHash?: string;
 }
 
+const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
+const APP_ROOT = path.basename(THIS_DIR) === 'dist' ? path.dirname(THIS_DIR) : THIS_DIR;
+
 const rawPort = process.env.PORT?.trim();
 const PORT: number | string = rawPort
   ? Number.isNaN(Number(rawPort))
     ? rawPort
     : Number(rawPort)
   : 3000;
-const DATA_DIR = path.resolve('data');
+const DATA_DIR = path.join(APP_ROOT, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
 const STORE_LOCK_FILE = path.join(DATA_DIR, 'store.lock');
 const SCHEDULER_LOCK_FILE = path.join(DATA_DIR, 'scheduler.lock');
 const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'instance.lock.json');
-const GENERATED_IMAGES_DIR = path.resolve('src/assets/images');
+const GENERATED_IMAGES_DIR = path.join(APP_ROOT, 'src/assets/images');
 const INSTANCE_ID = `${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 const LOCK_SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
 
@@ -198,6 +202,11 @@ function applyFreshStore(fresh: StoreData): void {
 }
 
 function reloadStoreFromDisk(): StoreData {
+  if (!fs.existsSync(STORE_FILE)) {
+    const clean = createDefaultStore();
+    applyFreshStore(clean);
+    return store;
+  }
   const fresh = parseStoreFromDisk();
   if (!fresh) return store;
   applyFreshStore(fresh);
@@ -2073,8 +2082,83 @@ async function startServer(): Promise<void> {
     });
   });
 
+  app.post('/api/system/reset', async (req, res) => {
+    const scope = (req.body as { scope?: string })?.scope;
+    if (scope !== 'posts' && scope !== 'groups' && scope !== 'all') {
+      res.status(400).json({ error: 'সঠিক রিসেট অপশন সিলেক্ট করুন' });
+      return;
+    }
+
+    stopRequested = true;
+    isBroadcasting = false;
+
+    if (scope === 'all') {
+      try {
+        if (userClient) {
+          await userClient.disconnect();
+        }
+        if (pendingUserAuth) {
+          await pendingUserAuth.client.disconnect();
+        }
+      } catch {
+        // ignore disconnect errors
+      }
+      userClient = null;
+      pendingUserAuth = null;
+      userbotStatus = {
+        apiConfigured: getApiCredentials().configured,
+        connected: false,
+        authStep: 'idle',
+        pendingPhone: null,
+        user: null,
+        lastError: null,
+      };
+    }
+
+    mutateStore((s) => {
+      const defaults = createDefaultStore();
+      if (scope === 'posts' || scope === 'all') {
+        s.products = [];
+        s.deletedProductIds = [];
+        s.logs = [];
+        s.config.enabled = false;
+        s.config.lastRunAt = null;
+        s.config.rotationIndex = 0;
+      }
+      if (scope === 'groups' || scope === 'all') {
+        s.groups = [];
+      }
+      if (scope === 'all') {
+        s.userSessionString = '';
+        s.config = { ...defaults.config, enabled: false };
+      }
+    });
+
+    if (scope === 'posts' || scope === 'all') {
+      try {
+        if (fs.existsSync(UPLOADS_DIR)) {
+          for (const entry of fs.readdirSync(UPLOADS_DIR)) {
+            const full = path.join(UPLOADS_DIR, entry);
+            if (fs.statSync(full).isFile()) {
+              fs.unlinkSync(full);
+            }
+          }
+        }
+      } catch {
+        // ignore upload cleanup errors
+      }
+    }
+
+    const msgMap = {
+      posts: 'সব পোস্ট, আপলোড করা ছবি ও হিস্ট্রি স্থায়ীভাবে মুছে ফেলা হয়েছে!',
+      groups: 'সব টার্গেট গ্রুপ তালিকা মুছে ফেলা হয়েছে!',
+      all: 'সম্পূর্ণ ফ্যাক্টরি রিসেট সম্পন্ন হয়েছে (টেলিগ্রাম সেশন, পোস্ট ও গ্রুপসহ)!',
+    };
+    res.json({ ok: true, message: msgMap[scope] });
+  });
+
   // ---------- BUILT-IN CODE EDITOR & SMART PATCHER API ----------
-  const EDITOR_ROOT = path.resolve('.');
+  const EDITOR_ROOT = APP_ROOT;
   const EDITOR_ROOT_ALLOWLIST = [
     'server.ts',
     'index.html',
@@ -2315,7 +2399,7 @@ async function startServer(): Promise<void> {
     });
   });
 
-  const distDir = path.resolve('dist');
+  const distDir = path.join(APP_ROOT, 'dist');
   const distIndex = path.join(distDir, 'index.html');
   if (process.env.NODE_ENV !== 'production' || !fs.existsSync(distIndex)) {
     const { createServer: createViteServer } = await import('vite');
@@ -2346,7 +2430,10 @@ async function startServer(): Promise<void> {
   }
 
   // Terminate any orphaned previous BazarBot worker in this same directory before claiming lock
-  if (process.env.NODE_ENV === 'production') {
+  const isProdRuntime =
+    process.env.NODE_ENV === 'production' ||
+    process.argv.some((a) => a.includes('cpanel-start') || a.includes('server.mjs'));
+  if (isProdRuntime) {
     terminateOrphanedWorkers();
   }
   claimActiveInstance();
@@ -2415,14 +2502,32 @@ function isCurrentActiveInstance(): boolean {
   return true;
 }
 
+function getAncestorPids(): Set<number> {
+  const ancestors = new Set<number>([process.pid, process.ppid]);
+  let cur = process.ppid;
+  for (let i = 0; i < 4 && cur > 1; i++) {
+    try {
+      const stat = fs.readFileSync(`/proc/${cur}/stat`, 'utf-8');
+      const afterComm = stat.slice(stat.lastIndexOf(')') + 2);
+      const ppid = Number(afterComm.split(' ')[1]);
+      if (!Number.isFinite(ppid) || ppid <= 1 || ancestors.has(ppid)) break;
+      ancestors.add(ppid);
+      cur = ppid;
+    } catch {
+      break;
+    }
+  }
+  return ancestors;
+}
+
 function terminateOrphanedWorkers(): void {
-  const cwd = process.cwd();
+  const ancestors = getAncestorPids();
   const stalePids = new Set<number>();
 
   try {
     if (fs.existsSync(INSTANCE_LOCK_FILE)) {
       const prev = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf-8')) as { pid?: number };
-      if (typeof prev.pid === 'number' && prev.pid > 1 && prev.pid !== process.pid && prev.pid !== process.ppid) {
+      if (typeof prev.pid === 'number' && prev.pid > 1 && !ancestors.has(prev.pid)) {
         stalePids.add(prev.pid);
       }
     }
@@ -2435,16 +2540,24 @@ function terminateOrphanedWorkers(): void {
       for (const entry of fs.readdirSync('/proc')) {
         if (!/^\d+$/.test(entry)) continue;
         const pid = Number(entry);
-        if (pid <= 1 || pid === process.pid || pid === process.ppid) continue;
+        if (pid <= 1 || ancestors.has(pid)) continue;
         try {
           const procCwd = fs.readlinkSync(`/proc/${pid}/cwd`);
-          if (procCwd !== cwd) continue;
+          if (procCwd !== APP_ROOT) continue;
           const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ');
-          if (
+          let exe = '';
+          try {
+            exe = fs.readlinkSync(`/proc/${pid}/exe`);
+          } catch {
+            // ignore exe read error
+          }
+          const isBazarNode =
+            cmdline.includes('lsnode:') ||
             cmdline.includes('cpanel-start.cjs') ||
             cmdline.includes('server.mjs') ||
-            cmdline.includes('server.ts')
-          ) {
+            cmdline.includes('server.ts') ||
+            path.basename(exe).startsWith('node');
+          if (isBazarNode) {
             stalePids.add(pid);
           }
         } catch {

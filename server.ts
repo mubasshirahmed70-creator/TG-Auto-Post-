@@ -18,18 +18,41 @@ import type {
   UserbotStatus,
 } from './src/types.ts';
 
-interface StoreData {
-  products: ProductItem[];
-  deletedProductIds?: string[];
-  groups: TelegramGroup[];
-  config: SchedulerConfig;
-  logs: PostLog[];
-  updateOffset: number;
-  userSessionString: string;
-  authSecret: string;
-  adminPasswordSalt?: string;
-  adminPasswordHash?: string;
-}
+import {
+  initDatabase,
+  getMeta,
+  setMeta,
+  getConfig,
+  getRuntimeConfig,
+  listProducts,
+  listActiveProducts,
+  getProduct,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  listGroups,
+  listEnabledGroups,
+  getGroup,
+  syncUserbotGroupsBatch,
+  upsertGroupByChatId,
+  markGroupRemoved,
+  updateGroup,
+  deleteGroup,
+  clearLogs,
+  recordSendResult,
+  toggleScheduler,
+  updateConfigSettings,
+  setNextRunAt,
+  disableSchedulerInDb,
+  setRotationIndex,
+  finishBroadcastTimestamps,
+  isRunStillActive,
+  getFullState,
+  resetDatabase,
+  tryAcquireSchedulerLease,
+  renewSchedulerLease,
+  releaseSchedulerLease,
+} from './db.ts';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = path.basename(THIS_DIR) === 'dist' ? path.dirname(THIS_DIR) : THIS_DIR;
@@ -42,186 +65,12 @@ const PORT: number | string = rawPort
   : 3000;
 const DATA_DIR = path.join(APP_ROOT, 'data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
-const STORE_FILE = path.join(DATA_DIR, 'store.json');
-const STORE_LOCK_FILE = path.join(DATA_DIR, 'store.lock');
-const SCHEDULER_LOCK_FILE = path.join(DATA_DIR, 'scheduler.lock');
 const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'instance.lock.json');
 const GENERATED_IMAGES_DIR = path.join(APP_ROOT, 'src/assets/images');
 const INSTANCE_ID = `${process.pid}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-const LOCK_SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
 
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-
-function withStoreLock<T>(fn: () => T): T {
-  let acquired = false;
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    try {
-      const fd = fs.openSync(STORE_LOCK_FILE, 'wx');
-      fs.writeFileSync(fd, `${process.pid}:${Date.now()}`, 'utf-8');
-      fs.closeSync(fd);
-      acquired = true;
-      break;
-    } catch {
-      try {
-        if (fs.existsSync(STORE_LOCK_FILE)) {
-          const stat = fs.statSync(STORE_LOCK_FILE);
-          if (Date.now() - stat.mtimeMs > 8000) {
-            fs.unlinkSync(STORE_LOCK_FILE);
-            continue;
-          }
-        }
-      } catch {
-        // ignore stale-check race
-      }
-      Atomics.wait(LOCK_SLEEP_BUF, 0, 0, 12);
-    }
-  }
-  try {
-    return fn();
-  } finally {
-    if (acquired) {
-      try {
-        if (fs.existsSync(STORE_LOCK_FILE)) {
-          fs.unlinkSync(STORE_LOCK_FILE);
-        }
-      } catch {
-        // ignore unlock error
-      }
-    }
-  }
-}
-
-function createDefaultStore(): StoreData {
-  const nextRun = new Date(Date.now() + 150 * 60 * 1000).toISOString();
-
-  return {
-    products: [],
-    deletedProductIds: [],
-    groups: [],
-    config: {
-      enabled: false,
-      postingMode: 'userbot',
-      intervalMinutes: 150,
-      delayBetweenGroupsSec: 60,
-      activeHoursEnabled: true,
-      activeStartHour: 8,
-      activeEndHour: 23,
-      rotationMode: 'sequential',
-      sellerContactUrl: 'https://t.me/',
-      buttonText: 'অর্ডার করতে মেসেজ দিন',
-      appendFooterTag: false,
-      footerText: '',
-      nextRunAt: nextRun,
-      lastRunAt: null,
-      rotationIndex: 0,
-    },
-    logs: [],
-    updateOffset: 0,
-    userSessionString: '',
-    authSecret: crypto.randomBytes(32).toString('hex'),
-  };
-}
-
-function normalizeStoreData(parsed: Partial<StoreData>): StoreData {
-  const defaults = createDefaultStore();
-  const deletedList = Array.isArray(parsed.deletedProductIds)
-    ? parsed.deletedProductIds.filter((id): id is string => typeof id === 'string').slice(-300)
-    : [];
-  const deletedSet = new Set(deletedList);
-  const products = (Array.isArray(parsed.products) ? parsed.products : []).filter(
-    (p) => p && typeof p.id === 'string' && !deletedSet.has(p.id)
-  );
-  const config: SchedulerConfig = { ...defaults.config, ...(parsed.config ?? {}) };
-  if (products.filter((p) => p.active).length === 0) {
-    config.enabled = false;
-  }
-
-  return {
-    products,
-    deletedProductIds: deletedList,
-    groups: Array.isArray(parsed.groups) ? parsed.groups : [],
-    config,
-    logs: Array.isArray(parsed.logs) ? parsed.logs : [],
-    updateOffset: typeof parsed.updateOffset === 'number' ? parsed.updateOffset : 0,
-    userSessionString: typeof parsed.userSessionString === 'string' ? parsed.userSessionString : '',
-    authSecret:
-      typeof parsed.authSecret === 'string' && parsed.authSecret.length >= 16
-        ? parsed.authSecret
-        : defaults.authSecret,
-    adminPasswordSalt:
-      typeof parsed.adminPasswordSalt === 'string' ? parsed.adminPasswordSalt : undefined,
-    adminPasswordHash:
-      typeof parsed.adminPasswordHash === 'string' ? parsed.adminPasswordHash : undefined,
-  };
-}
-
-function parseStoreFromDisk(): StoreData | null {
-  try {
-    if (!fs.existsSync(STORE_FILE)) return null;
-    const raw = fs.readFileSync(STORE_FILE, 'utf-8');
-    if (!raw.trim()) return null;
-    const parsed = JSON.parse(raw) as Partial<StoreData>;
-    return normalizeStoreData(parsed);
-  } catch (err) {
-    console.error('Failed to read store.json:', err);
-    return null;
-  }
-}
-
-function saveStore(data: StoreData): void {
-  const normalized = normalizeStoreData(data);
-  const tmpFile = `${STORE_FILE}.tmp.${process.pid}.${Date.now()}`;
-  fs.writeFileSync(tmpFile, JSON.stringify(normalized, null, 2), 'utf-8');
-  fs.renameSync(tmpFile, STORE_FILE);
-}
-
-function loadStore(): StoreData {
-  return withStoreLock(() => {
-    const fromDisk = parseStoreFromDisk();
-    if (fromDisk) return fromDisk;
-    const initial = createDefaultStore();
-    saveStore(initial);
-    return initial;
-  });
-}
-
-const store = loadStore();
-
-function applyFreshStore(fresh: StoreData): void {
-  store.products = fresh.products;
-  store.deletedProductIds = fresh.deletedProductIds;
-  store.groups = fresh.groups;
-  store.config = fresh.config;
-  store.logs = fresh.logs;
-  store.updateOffset = fresh.updateOffset;
-  store.userSessionString = fresh.userSessionString;
-  store.authSecret = fresh.authSecret;
-  store.adminPasswordSalt = fresh.adminPasswordSalt;
-  store.adminPasswordHash = fresh.adminPasswordHash;
-}
-
-function reloadStoreFromDisk(): StoreData {
-  if (!fs.existsSync(STORE_FILE)) {
-    const clean = createDefaultStore();
-    applyFreshStore(clean);
-    return store;
-  }
-  const fresh = parseStoreFromDisk();
-  if (!fresh) return store;
-  applyFreshStore(fresh);
-  return store;
-}
-
-function mutateStore<T>(mutator: (s: StoreData) => T): T {
-  return withStoreLock(() => {
-    reloadStoreFromDisk();
-    const result = mutator(store);
-    saveStore(store);
-    reloadStoreFromDisk();
-    return result;
-  });
-}
+initDatabase(DATA_DIR);
 
 function getApiCredentials(): { apiId: number; apiHash: string; configured: boolean } {
   const apiId = Number.parseInt(process.env.TELEGRAM_API_ID?.trim() ?? '', 10);
@@ -243,12 +92,13 @@ function hashPasswordWithSalt(password: string, salt: string): string {
 }
 
 function verifySubmittedPassword(submitted: string): boolean {
-  reloadStoreFromDisk();
-  if (store.adminPasswordSalt && store.adminPasswordHash) {
-    const derived = hashPasswordWithSalt(submitted, store.adminPasswordSalt);
+  const salt = getMeta('admin_password_salt');
+  const hash = getMeta('admin_password_hash');
+  if (salt && hash) {
+    const derived = hashPasswordWithSalt(submitted, salt);
     return crypto.timingSafeEqual(
       Buffer.from(derived, 'hex'),
-      Buffer.from(store.adminPasswordHash, 'hex')
+      Buffer.from(hash, 'hex')
     );
   }
   const expected = getAdminPassword();
@@ -258,10 +108,10 @@ function verifySubmittedPassword(submitted: string): boolean {
 }
 
 function getSigningKey(): string {
-  reloadStoreFromDisk();
-  const passwordMaterial = store.adminPasswordHash ?? getAdminPassword();
+  const passwordMaterial = getMeta('admin_password_hash') ?? getAdminPassword();
+  const authSecret = getMeta('auth_secret') ?? 'bazarbot-fallback-secret';
   return crypto
-    .createHmac('sha256', store.authSecret)
+    .createHmac('sha256', authSecret)
     .update(passwordMaterial)
     .digest('hex');
 }
@@ -451,8 +301,9 @@ function translateTelegramError(rawMsg: string): string {
 async function initUserbotClient(): Promise<void> {
   const { apiId, apiHash, configured } = getApiCredentials();
   userbotStatus.apiConfigured = configured;
+  const sessionStr = getMeta('user_session_string') || '';
 
-  if (!configured || !store.userSessionString) {
+  if (!configured || !sessionStr) {
     userbotStatus.connected = false;
     userbotStatus.authStep = 'idle';
     userbotStatus.user = null;
@@ -461,7 +312,7 @@ async function initUserbotClient(): Promise<void> {
 
   try {
     const client = new TelegramClient(
-      new sessions.StringSession(store.userSessionString),
+      new sessions.StringSession(sessionStr),
       apiId,
       apiHash,
       { connectionRetries: 5 }
@@ -472,9 +323,7 @@ async function initUserbotClient(): Promise<void> {
       userbotStatus.connected = false;
       userbotStatus.authStep = 'idle';
       userbotStatus.user = null;
-      mutateStore((s) => {
-        s.userSessionString = '';
-      });
+      setMeta('user_session_string', '');
       return;
     }
 
@@ -507,60 +356,40 @@ async function syncUserbotDialogs(): Promise<number> {
   }
 
   const dialogs = await userClient.getDialogs({ limit: 150 });
-  const addedOrUpdated = mutateStore((s) => {
-    let count = 0;
+  const batch: Array<{
+    chatId: string;
+    title: string;
+    username?: string;
+    type: TelegramGroup['type'];
+  }> = [];
 
-    for (const d of dialogs) {
-      if (!d.isGroup && !d.isChannel) continue;
+  for (const d of dialogs) {
+    if (!d.isGroup && !d.isChannel) continue;
 
-      // Skip read-only broadcast channels unless user is creator or has post rights
-      const entity = d.entity;
-      if (entity instanceof Api.Channel && entity.broadcast && !entity.creator && !entity.adminRights?.postMessages) {
-        continue;
-      }
-
-      const chatIdStr = d.id ? d.id.toString() : '';
-      if (!chatIdStr) continue;
-
-      const title = d.title || d.name || `Group ${chatIdStr}`;
-      const username =
-        entity && 'username' in entity && typeof entity.username === 'string'
-          ? entity.username
-          : undefined;
-      const type: TelegramGroup['type'] = d.isGroup
-        ? entity instanceof Api.Channel
-          ? 'supergroup'
-          : 'group'
-        : 'channel';
-
-      const existing = s.groups.find((g) => g.chatId === chatIdStr);
-      if (existing) {
-        existing.title = title;
-        existing.username = username ?? existing.username;
-        existing.type = type;
-        count++;
-      } else {
-        s.groups.unshift({
-          id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-          chatId: chatIdStr,
-          title,
-          username,
-          type,
-          enabled: false, // Let merchant toggle on the exact buy-sell groups they want!
-          postCount: 0,
-          lastPostedAt: null,
-          lastError: null,
-          addedVia: 'userbot_sync',
-          addedAt: new Date().toISOString(),
-        });
-        count++;
-      }
+    // Skip read-only broadcast channels unless user is creator or has post rights
+    const entity = d.entity;
+    if (entity instanceof Api.Channel && entity.broadcast && !entity.creator && !entity.adminRights?.postMessages) {
+      continue;
     }
 
-    return count;
-  });
+    const chatIdStr = d.id ? d.id.toString() : '';
+    if (!chatIdStr) continue;
 
-  return addedOrUpdated;
+    const title = d.title || d.name || `Group ${chatIdStr}`;
+    const username =
+      entity && 'username' in entity && typeof entity.username === 'string'
+        ? entity.username
+        : undefined;
+    const type: TelegramGroup['type'] = d.isGroup
+      ? entity instanceof Api.Channel
+        ? 'supergroup'
+        : 'group'
+      : 'channel';
+
+    batch.push({ chatId: chatIdStr, title, username, type });
+  }
+
+  return syncUserbotGroupsBatch(batch);
 }
 
 async function sendProductViaUserbot(
@@ -649,6 +478,9 @@ function httpsPostBuffer<T>(
         });
       }
     );
+    req.setTimeout(25_000, () => {
+      req.destroy(new Error('Telegram API request timed out (25s)'));
+    });
     req.on('error', reject);
     req.write(bodyBuffer);
     req.end();
@@ -760,34 +592,17 @@ function upsertGroupFromChat(
     return null;
   }
 
-  const groupType: TelegramGroup['type'] = chat.type;
   const chatIdStr = String(chat.id);
-  return mutateStore((s) => {
-    const existing = s.groups.find((g) => g.chatId === chatIdStr);
-    if (existing) {
-      existing.title = chat.title ?? existing.title;
-      existing.username = chat.username ?? existing.username;
-      existing.type = groupType;
-      existing.lastError = null;
-      return existing;
-    }
-
-    const created: TelegramGroup = {
-      id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-      chatId: chatIdStr,
-      title: chat.title ?? (chat.username ? `@${chat.username}` : `Group ${chatIdStr}`),
-      username: chat.username,
-      type: groupType,
-      enabled: true,
-      postCount: 0,
-      lastPostedAt: null,
-      lastError: null,
-      addedVia,
-      addedAt: new Date().toISOString(),
-    };
-    s.groups.unshift(created);
-    return created;
+  const res = upsertGroupByChatId({
+    chatId: chatIdStr,
+    title: chat.title ?? (chat.username ? `@${chat.username}` : `Group ${chatIdStr}`),
+    username: chat.username,
+    type: chat.type,
+    addedVia,
+    lastError: null,
+    defaultEnabled: true,
   });
+  return res.group;
 }
 
 async function pollTelegramUpdates(): Promise<void> {
@@ -801,10 +616,10 @@ async function pollTelegramUpdates(): Promise<void> {
   }
 
   try {
-    reloadStoreFromDisk();
+    const currentOffset = Number(getMeta('update_offset') || '0') || 0;
     botStatus.pollingActive = true;
     const res = await telegramRequest<TelegramUpdatePayload[]>('getUpdates', {
-      offset: store.updateOffset,
+      offset: currentOffset,
       limit: 50,
       timeout: 0,
       allowed_updates: ['message', 'my_chat_member'],
@@ -818,7 +633,7 @@ async function pollTelegramUpdates(): Promise<void> {
     botStatus.connected = true;
     botStatus.lastPollError = null;
     const updates = res.result ?? [];
-    let nextOffset = store.updateOffset;
+    let nextOffset = currentOffset;
 
     for (const upd of updates) {
       nextOffset = Math.max(nextOffset, upd.update_id + 1);
@@ -830,13 +645,7 @@ async function pollTelegramUpdates(): Promise<void> {
           if (memberStatus === 'member' || memberStatus === 'administrator') {
             upsertGroupFromChat(chat, 'auto');
           } else if (memberStatus === 'left' || memberStatus === 'kicked') {
-            mutateStore((s) => {
-              const existing = s.groups.find((g) => g.chatId === String(chat.id));
-              if (existing) {
-                existing.enabled = false;
-                existing.lastError = 'বটটি গ্রুপ থেকে রিমুভ করা হয়েছে';
-              }
-            });
+            markGroupRemoved(String(chat.id), 'বটটি গ্রুপ থেকে রিমুভ করা হয়েছে');
           }
         }
       }
@@ -876,9 +685,7 @@ async function pollTelegramUpdates(): Promise<void> {
     }
 
     if (updates.length > 0) {
-      mutateStore((s) => {
-        s.updateOffset = Math.max(s.updateOffset, nextOffset);
-      });
+      setMeta('update_offset', String(Math.max(currentOffset, nextOffset)));
     }
   } catch (err) {
     botStatus.lastPollError = err instanceof Error ? err.message : 'Polling error';
@@ -1014,46 +821,28 @@ async function sendProductToGroup(
 
 // ---------- BROADCAST & SCHEDULER ----------
 
-let stopRequested = false;
-
-function addLogToStore(targetStore: StoreData, entry: Omit<PostLog, 'id' | 'timestamp'>): void {
-  targetStore.logs.unshift({
-    id: `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-    timestamp: new Date().toISOString(),
-    ...entry,
-  });
-  if (targetStore.logs.length > 200) {
-    targetStore.logs = targetStore.logs.slice(0, 200);
-  }
-}
-
-function selectProductsForRound(specificProductId?: string): ProductItem[] {
+function selectProductsForRound(config: SchedulerConfig, specificProductId?: string): ProductItem[] {
   if (specificProductId) {
-    const found = store.products.find((p) => p.id === specificProductId);
+    const found = getProduct(specificProductId);
     return found ? [found] : [];
   }
 
-  const activeProducts = store.products.filter((p) => p.active);
+  const activeProducts = listActiveProducts();
   if (activeProducts.length === 0) {
     return [];
   }
 
-  if (store.config.rotationMode === 'all_active') {
+  if (config.rotationMode === 'all_active') {
     return activeProducts;
   }
 
-  if (store.config.rotationMode === 'random') {
+  if (config.rotationMode === 'random') {
     const idx = Math.floor(Math.random() * activeProducts.length);
     return [activeProducts[idx]];
   }
 
-  const idx = store.config.rotationIndex % activeProducts.length;
-  mutateStore((s) => {
-    const freshActive = s.products.filter((p) => p.active);
-    if (freshActive.length > 0) {
-      s.config.rotationIndex = (idx + 1) % freshActive.length;
-    }
-  });
+  const idx = config.rotationIndex % activeProducts.length;
+  setRotationIndex((idx + 1) % activeProducts.length);
   return [activeProducts[idx]];
 }
 
@@ -1061,50 +850,44 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function sleepInterruptible(ms: number, isScheduled: boolean, productId: string): Promise<boolean> {
+async function sleepInterruptible(
+  ms: number,
+  isScheduled: boolean,
+  expectedRunId: string,
+  productId: string
+): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
+    if (isShuttingDown) {
+      return false;
+    }
     await sleep(Math.min(1000, Math.max(50, deadline - Date.now())));
-    if (isScheduled) {
-      reloadStoreFromDisk();
-      if (!store.config.enabled || stopRequested) {
-        return false;
-      }
-      if (!store.products.some((p) => p.id === productId && p.active)) {
-        return false;
-      }
+    if (isScheduled && !isRunStillActive(expectedRunId, productId)) {
+      return false;
     }
   }
   return true;
 }
 
-function tryAcquireSchedulerLock(): boolean {
+async function withSendTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  fallbackValue: T
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
   try {
-    if (fs.existsSync(SCHEDULER_LOCK_FILE)) {
-      const stat = fs.statSync(SCHEDULER_LOCK_FILE);
-      // Recover stale lock older than 5 minutes
-      if (Date.now() - stat.mtimeMs > 5 * 60 * 1000) {
-        fs.unlinkSync(SCHEDULER_LOCK_FILE);
-      }
-    }
-    const fd = fs.openSync(SCHEDULER_LOCK_FILE, 'wx');
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf-8');
-    fs.closeSync(fd);
-    return true;
-  } catch {
-    return false;
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallbackValue), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
-function releaseSchedulerLock(): void {
-  try {
-    if (fs.existsSync(SCHEDULER_LOCK_FILE)) {
-      fs.unlinkSync(SCHEDULER_LOCK_FILE);
-    }
-  } catch {
-    // ignore cleanup error
-  }
-}
+let lastUserbotReconnectAttemptMs = 0;
 
 async function executeBroadcastRound(options?: {
   productId?: string;
@@ -1116,15 +899,18 @@ async function executeBroadcastRound(options?: {
     return { sent: 0, failed: 0, dryRunCount: 0, error: 'একটি ব্রডকাস্ট ইতোমধ্যে চলছে' };
   }
 
-  reloadStoreFromDisk();
+  const startCfg = getRuntimeConfig();
   const isScheduled = Boolean(options?.isScheduled);
-  if (isScheduled && (!store.config.enabled || stopRequested)) {
+  if (isScheduled && !startCfg.enabled) {
     return { sent: 0, failed: 0, dryRunCount: 0 };
   }
 
   const targetGroups = options?.groupId
-    ? store.groups.filter((g) => g.id === options.groupId)
-    : store.groups.filter((g) => g.enabled);
+    ? (() => {
+        const g = getGroup(options.groupId);
+        return g ? [g] : [];
+      })()
+    : listEnabledGroups();
 
   if (targetGroups.length === 0) {
     return {
@@ -1135,20 +921,16 @@ async function executeBroadcastRound(options?: {
     };
   }
 
-  const chosenProducts = selectProductsForRound(options?.productId);
+  const chosenProducts = selectProductsForRound(startCfg, options?.productId);
   if (chosenProducts.length === 0) {
-    if (store.config.enabled) {
-      mutateStore((s) => {
-        if (s.products.filter((p) => p.active).length === 0) {
-          s.config.enabled = false;
-        }
-      });
+    if (startCfg.enabled && listActiveProducts().length === 0) {
+      disableSchedulerInDb();
     }
     return { sent: 0, failed: 0, dryRunCount: 0, error: 'কোনো সক্রিয় পোস্ট পাওয়া যায়নি' };
   }
 
   const dryRun = Boolean(options?.dryRun);
-  const mode = store.config.postingMode;
+  const mode = startCfg.postingMode;
 
   if (!dryRun) {
     if (mode === 'userbot' && (!userClient || !userbotStatus.connected)) {
@@ -1176,95 +958,96 @@ async function executeBroadcastRound(options?: {
   let aborted = false;
 
   try {
-    const delayMs = Math.max(1, store.config.delayBetweenGroupsSec) * 1000;
+    const delayMs = Math.max(1, startCfg.delayBetweenGroupsSec) * 1000;
+    const expectedRunId = startCfg.schedulerRunId;
 
     for (let pIdx = 0; pIdx < chosenProducts.length && !aborted; pIdx++) {
       const product = chosenProducts[pIdx];
 
       for (let gIdx = 0; gIdx < targetGroups.length; gIdx++) {
-        // Re-verify fresh state from disk before every single Telegram send
-        reloadStoreFromDisk();
-        if (isScheduled && (!store.config.enabled || stopRequested)) {
+        // Re-verify fresh SQLite state before every single Telegram send
+        if (isShuttingDown) {
           aborted = true;
           break;
         }
-        const liveProduct = store.products.find((p) => p.id === product.id);
+        const liveConfig = getRuntimeConfig();
+        if (isScheduled && (!liveConfig.enabled || (expectedRunId && liveConfig.schedulerRunId !== expectedRunId))) {
+          aborted = true;
+          break;
+        }
+
+        const liveProduct = getProduct(product.id);
         if (!liveProduct || (isScheduled && !liveProduct.active)) {
           aborted = true;
           break;
         }
 
-        const group = targetGroups[gIdx];
-        const liveGroup = store.groups.find((g) => g.id === group.id);
-        if (!liveGroup) {
+        const liveGroup = getGroup(targetGroups[gIdx].id);
+        if (!liveGroup || (!options?.groupId && !liveGroup.enabled)) {
           continue;
         }
 
-        const result =
+        if (isScheduled) {
+          renewSchedulerLease(INSTANCE_ID, 120_000);
+        }
+
+        const rawSendPromise =
           mode === 'userbot'
-            ? await sendProductViaUserbot(liveProduct, liveGroup, store.config, dryRun)
-            : await sendProductToGroup(liveProduct, liveGroup, store.config, dryRun);
+            ? sendProductViaUserbot(liveProduct, liveGroup, liveConfig, dryRun)
+            : sendProductToGroup(liveProduct, liveGroup, liveConfig, dryRun);
 
-        const nowIso = new Date().toISOString();
-        mutateStore((s) => {
-          const targetProd = s.products.find((p) => p.id === liveProduct.id);
-          const targetGrp = s.groups.find((g) => g.id === liveGroup.id);
+        const result = await withSendTimeout(rawSendPromise, 45_000, {
+          ok: false,
+          error: 'টেলিগ্রাম সার্ভার সাড়া দেয়নি (৪৫ সেকেন্ড টাইমআউট) — পরবর্তী গ্রুপে যাচ্ছে',
+        });
 
-          if (result.ok) {
-            if (result.dryRun) {
-              dryRunCount++;
-              addLogToStore(s, {
-                productId: liveProduct.id,
-                productName: liveProduct.name,
-                groupId: liveGroup.id,
-                groupTitle: liveGroup.title,
-                status: 'dry_run',
-                message: 'টেস্ট সিমুলেশন সম্পন্ন (বাস্তব টেলিগ্রাম মেসেজ পাঠানো হয়নি)',
-              });
-            } else {
-              sent++;
-              if (targetProd) {
-                targetProd.postCount += 1;
-                targetProd.lastPostedAt = nowIso;
-              }
-              if (targetGrp) {
-                targetGrp.postCount += 1;
-                targetGrp.lastPostedAt = nowIso;
-                targetGrp.lastError = null;
-              }
-              addLogToStore(s, {
-                productId: liveProduct.id,
-                productName: liveProduct.name,
-                groupId: liveGroup.id,
-                groupTitle: liveGroup.title,
-                status: 'success',
-                message:
-                  mode === 'userbot'
-                    ? 'পার্সোনাল অ্যাকাউন্ট থেকে সফলভাবে পোস্ট হয়েছে'
-                    : 'বটের মাধ্যমে সফলভাবে পোস্ট হয়েছে',
-                telegramMessageId: result.messageId,
-              });
-            }
-          } else {
-            failed++;
-            if (targetGrp) {
-              targetGrp.lastError = result.error ?? 'Unknown error';
-            }
-            addLogToStore(s, {
+        if (result.ok) {
+          if (result.dryRun) {
+            dryRunCount++;
+            recordSendResult({
               productId: liveProduct.id,
               productName: liveProduct.name,
               groupId: liveGroup.id,
               groupTitle: liveGroup.title,
-              status: 'error',
-              message: result.error ?? 'পোস্ট ব্যর্থ হয়েছে',
+              status: 'dry_run',
+              message: 'টেস্ট সিমুলেশন সম্পন্ন (বাস্তব টেলিগ্রাম মেসেজ পাঠানো হয়নি)',
+            });
+          } else {
+            sent++;
+            recordSendResult({
+              productId: liveProduct.id,
+              productName: liveProduct.name,
+              groupId: liveGroup.id,
+              groupTitle: liveGroup.title,
+              status: 'success',
+              message:
+                mode === 'userbot'
+                  ? 'পার্সোনাল অ্যাকাউন্ট থেকে সফলভাবে পোস্ট হয়েছে'
+                  : 'বটের মাধ্যমে সফলভাবে পোস্ট হয়েছে',
+              telegramMessageId: result.messageId,
             });
           }
-        });
+        } else {
+          failed++;
+          recordSendResult({
+            productId: liveProduct.id,
+            productName: liveProduct.name,
+            groupId: liveGroup.id,
+            groupTitle: liveGroup.title,
+            status: 'error',
+            message: result.error ?? 'পোস্ট ব্যর্থ হয়েছে',
+          });
+        }
 
         const hasMore = gIdx < targetGroups.length - 1 || pIdx < chosenProducts.length - 1;
         if (hasMore && !dryRun) {
           const jitter = mode === 'userbot' ? Math.floor(Math.random() * 3000) : 0;
-          const keepGoing = await sleepInterruptible(delayMs + jitter, isScheduled, product.id);
+          const keepGoing = await sleepInterruptible(
+            delayMs + jitter,
+            isScheduled,
+            expectedRunId,
+            product.id
+          );
           if (!keepGoing) {
             aborted = true;
             break;
@@ -1273,13 +1056,8 @@ async function executeBroadcastRound(options?: {
       }
     }
 
-    const now = Date.now();
-    mutateStore((s) => {
-      s.config.lastRunAt = new Date(now).toISOString();
-      if (s.config.enabled) {
-        s.config.nextRunAt = new Date(now + s.config.intervalMinutes * 60 * 1000).toISOString();
-      }
-    });
+    const latestCfg = getConfig();
+    finishBroadcastTimestamps(new Date().toISOString(), latestCfg.intervalMinutes);
     return { sent, failed, dryRunCount };
   } finally {
     isBroadcasting = false;
@@ -1309,62 +1087,56 @@ function isWithinActiveHours(config: SchedulerConfig): boolean {
 }
 
 async function schedulerTick(): Promise<void> {
-  if (!isCurrentActiveInstance()) {
+  if (!isCurrentActiveInstance() || isBroadcasting || isShuttingDown) {
     return;
   }
-  if (isBroadcasting || stopRequested) {
-    return;
-  }
-  if (!tryAcquireSchedulerLock()) {
+  if (!tryAcquireSchedulerLease(INSTANCE_ID, 120_000)) {
     return;
   }
   try {
-    reloadStoreFromDisk();
-    if (!store.config.enabled || stopRequested) {
+    const cfg = getConfig();
+    if (!cfg.enabled) {
       return;
     }
-    if (store.products.filter((p) => p.active).length === 0) {
-      mutateStore((s) => {
-        if (s.products.filter((p) => p.active).length === 0) {
-          s.config.enabled = false;
-        }
-      });
+    if (listActiveProducts().length === 0) {
+      disableSchedulerInDb();
       return;
     }
-    if (store.config.postingMode === 'userbot' && (!userClient || !userbotStatus.connected)) {
-      return;
+    if (cfg.postingMode === 'userbot' && (!userClient || !userbotStatus.connected)) {
+      const savedSession = getMeta('user_session_string') || '';
+      if (savedSession && !pendingUserAuth && Date.now() - lastUserbotReconnectAttemptMs > 60_000) {
+        lastUserbotReconnectAttemptMs = Date.now();
+        await initUserbotClient();
+      }
+      if (!userClient || !userbotStatus.connected) {
+        return;
+      }
     }
-    if (store.config.postingMode === 'bot' && !getToken()) {
+    if (cfg.postingMode === 'bot' && !getToken()) {
       return;
     }
 
     const now = Date.now();
-    const nextRunMs = store.config.nextRunAt ? Date.parse(store.config.nextRunAt) : 0;
+    const nextRunMs = cfg.nextRunAt ? Date.parse(cfg.nextRunAt) : 0;
 
-    if (!nextRunMs) {
-      mutateStore((s) => {
-        s.config.nextRunAt = new Date(now + s.config.intervalMinutes * 60 * 1000).toISOString();
-      });
+    if (!nextRunMs || Number.isNaN(nextRunMs)) {
+      setNextRunAt(new Date(now + cfg.intervalMinutes * 60 * 1000).toISOString());
       return;
     }
 
     if (now >= nextRunMs) {
-      if (!isWithinActiveHours(store.config)) {
-        mutateStore((s) => {
-          s.config.nextRunAt = new Date(now + 15 * 60 * 1000).toISOString();
-        });
+      if (!isWithinActiveHours(cfg)) {
+        setNextRunAt(new Date(now + 15 * 60 * 1000).toISOString());
         return;
       }
 
-      // Advance nextRunAt on disk BEFORE broadcasting so concurrent workers/cron never double-send
-      mutateStore((s) => {
-        s.config.nextRunAt = new Date(now + s.config.intervalMinutes * 60 * 1000).toISOString();
-      });
+      // Advance nextRunAt in SQLite BEFORE broadcasting so concurrent workers/cron never double-send
+      setNextRunAt(new Date(now + cfg.intervalMinutes * 60 * 1000).toISOString());
 
       await executeBroadcastRound({ isScheduled: true });
     }
   } finally {
-    releaseSchedulerLock();
+    releaseSchedulerLease(INSTANCE_ID);
   }
 }
 
@@ -1468,10 +1240,8 @@ async function startServer(): Promise<void> {
       return;
     }
     const salt = crypto.randomBytes(16).toString('hex');
-    mutateStore((s) => {
-      s.adminPasswordSalt = salt;
-      s.adminPasswordHash = hashPasswordWithSalt(newPwd, salt);
-    });
+    setMeta('admin_password_salt', salt);
+    setMeta('admin_password_hash', hashPasswordWithSalt(newPwd, salt));
     res.json({ ok: true, token: createAuthToken() });
   });
 
@@ -1503,16 +1273,16 @@ async function startServer(): Promise<void> {
   });
 
   app.get('/api/state', (_req, res) => {
-    reloadStoreFromDisk();
     userbotStatus.apiConfigured = getApiCredentials().configured;
     botStatus.tokenConfigured = Boolean(getToken());
+    const dbState = getFullState();
     const payload: AppStateResponse = {
       botStatus,
       userbotStatus,
-      products: store.products,
-      groups: store.groups,
-      config: store.config,
-      logs: store.logs,
+      products: dbState.products,
+      groups: dbState.groups,
+      config: dbState.config,
+      logs: dbState.logs,
       isBroadcasting,
     };
     res.json(payload);
@@ -1598,9 +1368,7 @@ async function startServer(): Promise<void> {
       );
 
       const savedSession = String(client.session.save());
-      mutateStore((s) => {
-        s.userSessionString = savedSession;
-      });
+      setMeta('user_session_string', savedSession);
 
       const me = (await client.getMe()) as Api.User;
       userClient = client;
@@ -1656,9 +1424,7 @@ async function startServer(): Promise<void> {
       await client.invoke(new Api.auth.CheckPassword({ password: passwordSrp }));
 
       const savedSession = String(client.session.save());
-      mutateStore((s) => {
-        s.userSessionString = savedSession;
-      });
+      setMeta('user_session_string', savedSession);
 
       const me = (await client.getMe()) as Api.User;
       userClient = client;
@@ -1691,7 +1457,7 @@ async function startServer(): Promise<void> {
   app.post('/api/userbot/sync-dialogs', async (_req, res) => {
     try {
       const count = await syncUserbotDialogs();
-      res.json({ syncedCount: count, groups: store.groups });
+      res.json({ syncedCount: count, groups: listGroups() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'গ্রুপ লোড করা যায়নি' });
     }
@@ -1710,9 +1476,7 @@ async function startServer(): Promise<void> {
     }
     userClient = null;
     pendingUserAuth = null;
-    mutateStore((s) => {
-      s.userSessionString = '';
-    });
+    setMeta('user_session_string', '');
     userbotStatus = {
       apiConfigured: getApiCredentials().configured,
       connected: false,
@@ -1754,77 +1518,54 @@ async function startServer(): Promise<void> {
       createdAt: new Date().toISOString(),
     };
 
-    mutateStore((s) => {
-      s.products.unshift(created);
-    });
+    createProduct(created);
     res.status(201).json(created);
   });
 
   app.put('/api/products/:id', (req, res) => {
-    const body = req.body as Partial<ProductItem>;
-    const updatedResult = mutateStore<ProductItem | null>((s) => {
-      const idx = s.products.findIndex((p) => p.id === req.params.id);
-      if (idx === -1) return null;
-      const existing = s.products[idx];
-      const savedImages = Array.isArray(body.images) ? saveBase64Images(body.images) : existing.images;
-      const nextCaption = body.caption !== undefined ? body.caption.trim() : existing.caption;
-      const firstLine = nextCaption.split('\n').find((l) => l.trim().length > 0)?.trim() ?? existing.name;
-      const nextName =
-        body.name !== undefined
-          ? body.name.trim() || (firstLine.length > 52 ? `${firstLine.slice(0, 52)}...` : firstLine)
-          : body.caption !== undefined
-          ? firstLine.length > 52
-            ? `${firstLine.slice(0, 52)}...`
-            : firstLine
-          : existing.name;
-
-      const updated: ProductItem = {
-        ...existing,
-        name: nextName,
-        caption: nextCaption,
-        link: body.link !== undefined ? body.link.trim() || undefined : existing.link,
-        images: savedImages,
-        active: body.active !== undefined ? Boolean(body.active) : existing.active,
-      };
-      s.products[idx] = updated;
-      if (s.products.filter((p) => p.active).length === 0) {
-        s.config.enabled = false;
-        stopRequested = true;
-      }
-      return updated;
-    });
-
-    if (!updatedResult) {
+    const existing = getProduct(req.params.id);
+    if (!existing) {
       res.status(404).json({ error: 'পোস্ট পাওয়া যায়নি' });
       return;
     }
-    res.json(updatedResult);
+    const body = req.body as Partial<ProductItem>;
+    const savedImages = Array.isArray(body.images) ? saveBase64Images(body.images) : existing.images;
+    const nextCaption = body.caption !== undefined ? body.caption.trim() : existing.caption;
+    const firstLine = nextCaption.split('\n').find((l) => l.trim().length > 0)?.trim() ?? existing.name;
+    const nextName =
+      body.name !== undefined
+        ? body.name.trim() || (firstLine.length > 52 ? `${firstLine.slice(0, 52)}...` : firstLine)
+        : body.caption !== undefined
+        ? firstLine.length > 52
+          ? `${firstLine.slice(0, 52)}...`
+          : firstLine
+        : existing.name;
+
+    const result = updateProduct(req.params.id, {
+      name: nextName,
+      caption: nextCaption,
+      hasLinkField: body.link !== undefined,
+      link: body.link !== undefined ? body.link.trim() || undefined : existing.link,
+      images: savedImages,
+      active: body.active !== undefined ? Boolean(body.active) : existing.active,
+    });
+
+    if (!result.product) {
+      res.status(404).json({ error: 'পোস্ট পাওয়া যায়নি' });
+      return;
+    }
+    res.json({ ...result.product, autoStopped: result.autoStopped });
   });
 
   app.delete('/api/products/:id', (req, res) => {
     const productId = req.params.id;
-    const removedImages = mutateStore<string[] | null>((s) => {
-      const target = s.products.find((p) => p.id === productId);
-      if (!target) return null;
-      const deadImages = [...target.images];
-      s.products = s.products.filter((p) => p.id !== productId);
-      const deletedSet = new Set(s.deletedProductIds ?? []);
-      deletedSet.add(productId);
-      s.deletedProductIds = Array.from(deletedSet).slice(-300);
-      if (s.products.filter((p) => p.active).length === 0) {
-        s.config.enabled = false;
-        stopRequested = true;
-      }
-      const stillReferenced = new Set(s.products.flatMap((p) => p.images));
-      return deadImages.filter((img) => img.startsWith('/uploads/') && !stillReferenced.has(img));
-    });
-
-    if (removedImages === null) {
+    const delRes = deleteProduct(productId);
+    if (!delRes.deleted) {
       res.status(404).json({ error: 'প্রোডাক্ট পাওয়া যায়নি' });
       return;
     }
 
-    for (const imgPath of removedImages) {
+    for (const imgPath of delRes.unreferencedUploadImages) {
       try {
         const diskFile = path.join(UPLOADS_DIR, path.basename(imgPath));
         if (fs.existsSync(diskFile)) {
@@ -1835,7 +1576,11 @@ async function startServer(): Promise<void> {
       }
     }
 
-    res.json({ ok: true, schedulerEnabled: store.config.enabled });
+    res.json({
+      ok: true,
+      schedulerEnabled: delRes.schedulerEnabled,
+      autoStopped: delRes.autoStopped,
+    });
   });
 
   // ---------- GROUP ENDPOINTS ----------
@@ -1888,32 +1633,14 @@ async function startServer(): Promise<void> {
       }
     }
 
-    const createdOrUpdated = mutateStore<{ created: boolean; group: TelegramGroup }>((s) => {
-      const existing = s.groups.find((g) => g.chatId === resolvedChatId);
-      if (existing) {
-        existing.title = resolvedTitle;
-        existing.username = resolvedUsername ?? existing.username;
-        existing.type = resolvedType;
-        existing.lastError = lastError;
-        return { created: false, group: existing };
-      }
-
-      const created: TelegramGroup = {
-        id: `grp_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-        chatId: resolvedChatId,
-        title: resolvedTitle,
-        username: resolvedUsername,
-        type: resolvedType,
-        enabled: true,
-        postCount: 0,
-        lastPostedAt: null,
-        lastError,
-        addedVia: 'manual',
-        addedAt: new Date().toISOString(),
-      };
-
-      s.groups.unshift(created);
-      return { created: true, group: created };
+    const createdOrUpdated = upsertGroupByChatId({
+      chatId: resolvedChatId,
+      title: resolvedTitle,
+      username: resolvedUsername,
+      type: resolvedType,
+      addedVia: 'manual',
+      lastError,
+      defaultEnabled: true,
     });
 
     res.status(createdOrUpdated.created ? 201 : 200).json(createdOrUpdated.group);
@@ -1921,12 +1648,9 @@ async function startServer(): Promise<void> {
 
   app.put('/api/groups/:id', (req, res) => {
     const body = req.body as Partial<TelegramGroup>;
-    const updatedGroup = mutateStore<TelegramGroup | null>((s) => {
-      const group = s.groups.find((g) => g.id === req.params.id);
-      if (!group) return null;
-      if (body.enabled !== undefined) group.enabled = Boolean(body.enabled);
-      if (body.title !== undefined) group.title = body.title.trim() || group.title;
-      return group;
+    const updatedGroup = updateGroup(req.params.id, {
+      enabled: body.enabled !== undefined ? Boolean(body.enabled) : undefined,
+      title: body.title,
     });
     if (!updatedGroup) {
       res.status(404).json({ error: 'গ্রুপ পাওয়া যায়নি' });
@@ -1936,9 +1660,7 @@ async function startServer(): Promise<void> {
   });
 
   app.delete('/api/groups/:id', (req, res) => {
-    mutateStore((s) => {
-      s.groups = s.groups.filter((g) => g.id !== req.params.id);
-    });
+    deleteGroup(req.params.id);
     res.json({ ok: true });
   });
 
@@ -1951,7 +1673,7 @@ async function startServer(): Promise<void> {
     res.json({
       botStatus,
       userbotStatus,
-      groups: store.groups,
+      groups: listGroups(),
     });
   });
 
@@ -1959,83 +1681,32 @@ async function startServer(): Promise<void> {
 
   app.post('/api/scheduler/toggle', (req, res) => {
     const desired = Boolean((req.body as { enabled?: boolean }).enabled);
-    const result = mutateStore<{ error?: string; config: SchedulerConfig }>((s) => {
-      const activeCount = s.products.filter((p) => p.active).length;
-
-      if (desired && activeCount === 0) {
-        s.config.enabled = false;
-        stopRequested = true;
-        return {
-          error:
-            'কোনো সক্রিয় পোস্ট তৈরি করা নেই! আগে "পোস্ট" ট্যাব থেকে অন্তত ১টি পোস্ট তৈরি করুন, তারপর Start দিন।',
-          config: s.config,
-        };
-      }
-
-      s.config.enabled = desired;
-      if (!desired) {
-        stopRequested = true;
-      } else {
-        stopRequested = false;
-        s.config.nextRunAt = new Date(
-          Date.now() + s.config.intervalMinutes * 60 * 1000
-        ).toISOString();
-      }
-      return { config: s.config };
-    });
+    const result = toggleScheduler(desired);
 
     if (result.error) {
       res.status(400).json({ error: result.error, config: result.config });
       return;
+    }
+    if (result.config.enabled) {
+      setTimeout(() => {
+        void schedulerTick();
+      }, 5200).unref();
     }
     res.json(result.config);
   });
 
   app.put('/api/config', (req, res) => {
     const body = req.body as Partial<SchedulerConfig>;
-    const result = mutateStore<{ error?: string; config: SchedulerConfig }>((s) => {
-      const prevEnabled = s.config.enabled;
-      const prevInterval = s.config.intervalMinutes;
-      const activeCount = s.products.filter((p) => p.active).length;
-
-      // Never allow PUT /api/config to accidentally re-enable a stopped scheduler;
-      // Start must go through POST /api/scheduler/toggle (only explicit Stop is honored here).
-      const nextEnabled =
-        body.enabled === false ? false : activeCount === 0 ? false : prevEnabled;
-
-      s.config = {
-        ...s.config,
-        ...body,
-        enabled: nextEnabled,
-        postingMode:
-          body.postingMode === 'bot'
-            ? 'bot'
-            : body.postingMode === 'userbot'
-            ? 'userbot'
-            : s.config.postingMode,
-        intervalMinutes: Math.max(5, Number(body.intervalMinutes ?? s.config.intervalMinutes) || 150),
-        delayBetweenGroupsSec: Math.max(
-          1,
-          Math.min(180, Number(body.delayBetweenGroupsSec ?? s.config.delayBetweenGroupsSec) || 15)
-        ),
-        activeStartHour: Math.max(0, Math.min(23, Number(body.activeStartHour ?? s.config.activeStartHour))),
-        activeEndHour: Math.max(0, Math.min(23, Number(body.activeEndHour ?? s.config.activeEndHour))),
-      };
-
-      if (!s.config.enabled) {
-        stopRequested = true;
+    const updated = updateConfigSettings(body);
+    if (updated.enabled && updated.nextRunAt) {
+      const msUntil = Date.parse(updated.nextRunAt) - Date.now();
+      if (msUntil <= 10000) {
+        setTimeout(() => {
+          void schedulerTick();
+        }, Math.max(500, msUntil + 300)).unref();
       }
-
-      if (prevInterval !== s.config.intervalMinutes || !s.config.nextRunAt) {
-        s.config.nextRunAt = new Date(
-          Date.now() + s.config.intervalMinutes * 60 * 1000
-        ).toISOString();
-      }
-
-      return { config: s.config };
-    });
-
-    res.json(result.config);
+    }
+    res.json(updated);
   });
 
   app.post('/api/broadcast/now', async (req, res) => {
@@ -2055,18 +1726,16 @@ async function startServer(): Promise<void> {
   });
 
   app.delete('/api/logs', (_req, res) => {
-    mutateStore((s) => {
-      s.logs = [];
-    });
+    clearLogs();
     res.json({ ok: true });
   });
 
   app.get('/api/health', (_req, res) => {
-    reloadStoreFromDisk();
+    const cfg = getConfig();
     res.json({
       ok: true,
-      schedulerEnabled: store.config.enabled,
-      nextRunAt: store.config.nextRunAt,
+      schedulerEnabled: cfg.enabled,
+      nextRunAt: cfg.nextRunAt,
       userbotConnected: userbotStatus.connected,
       botConnected: botStatus.connected,
     });
@@ -2074,11 +1743,12 @@ async function startServer(): Promise<void> {
 
   app.get('/api/cron/tick', async (_req, res) => {
     await schedulerTick();
+    const cfg = getConfig();
     res.json({
       ok: true,
-      schedulerEnabled: store.config.enabled,
-      nextRunAt: store.config.nextRunAt,
-      lastRunAt: store.config.lastRunAt,
+      schedulerEnabled: cfg.enabled,
+      nextRunAt: cfg.nextRunAt,
+      lastRunAt: cfg.lastRunAt,
     });
   });
 
@@ -2089,7 +1759,6 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    stopRequested = true;
     isBroadcasting = false;
 
     if (scope === 'all') {
@@ -2115,24 +1784,7 @@ async function startServer(): Promise<void> {
       };
     }
 
-    mutateStore((s) => {
-      const defaults = createDefaultStore();
-      if (scope === 'posts' || scope === 'all') {
-        s.products = [];
-        s.deletedProductIds = [];
-        s.logs = [];
-        s.config.enabled = false;
-        s.config.lastRunAt = null;
-        s.config.rotationIndex = 0;
-      }
-      if (scope === 'groups' || scope === 'all') {
-        s.groups = [];
-      }
-      if (scope === 'all') {
-        s.userSessionString = '';
-        s.config = { ...defaults.config, enabled: false };
-      }
-    });
+    resetDatabase(scope);
 
     if (scope === 'posts' || scope === 'all') {
       try {
@@ -2161,6 +1813,7 @@ async function startServer(): Promise<void> {
   const EDITOR_ROOT = APP_ROOT;
   const EDITOR_ROOT_ALLOWLIST = [
     'server.ts',
+    'db.ts',
     'index.html',
     'package.json',
     'build-cpanel.mjs',
@@ -2455,6 +2108,8 @@ async function startServer(): Promise<void> {
     await pollTelegramUpdates();
   }
 
+  void schedulerTick();
+
   pollIntervalHandle = setInterval(() => {
     void pollTelegramUpdates();
   }, 5000);
@@ -2594,7 +2249,6 @@ function terminateOrphanedWorkers(): void {
 async function gracefulShutdown(reason: string): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
-  stopRequested = true;
   console.log(`Shutting down BazarBot worker ${process.pid} (${reason})...`);
 
   if (pollIntervalHandle) clearInterval(pollIntervalHandle);

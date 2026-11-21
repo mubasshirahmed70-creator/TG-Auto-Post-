@@ -32,6 +32,7 @@ function needsRebuild() {
   );
   const watchTargets = [
     path.join(__dirname, 'server.ts'),
+    path.join(__dirname, 'db.ts'),
     path.join(__dirname, 'build-cpanel.mjs'),
     path.join(__dirname, 'package.json'),
     path.join(__dirname, 'index.html'),

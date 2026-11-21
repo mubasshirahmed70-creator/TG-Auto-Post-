@@ -186,6 +186,34 @@ function formatIntervalLabel(minutes: number): string {
   return hrs > 0 ? `${hrs} ঘণ্টা ${rem} মিনিট` : `${minutes} মিনিট`;
 }
 
+function getDhakaHourClient(nowMs: number): number {
+  try {
+    const formatted = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Dhaka',
+      hour: 'numeric',
+      hour12: false,
+    }).format(new Date(nowMs));
+    const parsed = Number.parseInt(formatted, 10);
+    return Number.isNaN(parsed) ? new Date(nowMs).getHours() : parsed % 24;
+  } catch {
+    return new Date(nowMs).getHours();
+  }
+}
+
+function isWithinDhakaActiveHours(cfg: SchedulerConfig, nowMs: number): boolean {
+  if (!cfg.activeHoursEnabled) return true;
+  const h = getDhakaHourClient(nowMs);
+  if (cfg.activeStartHour <= cfg.activeEndHour) {
+    return h >= cfg.activeStartHour && h <= cfg.activeEndHour;
+  }
+  return h >= cfg.activeStartHour || h <= cfg.activeEndHour;
+}
+
+function formatHourRangeLabel(startHour: number, endHour: number): string {
+  const fmt = (h: number) => `${String(h).padStart(2, '0')}:00`;
+  return `${fmt(startHour)} – ${String(endHour).padStart(2, '0')}:59`;
+}
+
 const AUTH_TOKEN_KEY = 'bazarbot_auth_token';
 
 export default function App() {
@@ -563,8 +591,16 @@ export default function App() {
         body: JSON.stringify({ active: !product.active }),
       });
       if (!res.ok) throw new Error();
+      const data = (await res.json()) as { autoStopped?: boolean };
       await fetchState(false);
-      pushToast('info', !product.active ? 'পোস্ট চালু করা হয়েছে' : 'পোস্ট পজ করা হয়েছে');
+      if (data.autoStopped) {
+        pushToast(
+          'info',
+          'সব পোস্ট পজ করায় অটো-পোস্ট স্বয়ংক্রিয়ভাবে Stop হয়েছে — নতুন পোস্ট চালু করে আবার Start দিন।'
+        );
+      } else {
+        pushToast('info', !product.active ? 'পোস্ট চালু করা হয়েছে' : 'পোস্ট পজ করা হয়েছে');
+      }
     } catch {
       pushToast('error', 'স্ট্যাটাস পরিবর্তন করা যায়নি');
     }
@@ -575,18 +611,31 @@ export default function App() {
     try {
       const res = await apiFetch(`/api/products/${id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error();
+      const data = (await res.json()) as { autoStopped?: boolean; schedulerEnabled?: boolean };
       setState((prev) => {
         if (!prev) return prev;
         const remaining = prev.products.filter((p) => p.id !== id);
-        const stillHasActive = remaining.some((p) => p.active);
+        const nextEnabled =
+          typeof data.schedulerEnabled === 'boolean'
+            ? data.schedulerEnabled
+            : remaining.some((p) => p.active)
+            ? prev.config.enabled
+            : false;
         return {
           ...prev,
           products: remaining,
-          config: stillHasActive ? prev.config : { ...prev.config, enabled: false },
+          config: { ...prev.config, enabled: nextEnabled },
         };
       });
       await fetchState(false);
-      pushToast('info', 'পোস্ট ডিলিট করা হয়েছে');
+      if (data.autoStopped) {
+        pushToast(
+          'info',
+          'শেষ সক্রিয় পোস্ট ডিলিট হওয়ায় অটো-পোস্ট Stop হয়েছে — নতুন পোস্ট যোগ করে আবার Start দিন।'
+        );
+      } else {
+        pushToast('info', 'পোস্ট ডিলিট করা হয়েছে');
+      }
     } catch {
       pushToast('error', 'পোস্ট ডিলিট করা যায়নি');
     }
@@ -721,6 +770,9 @@ export default function App() {
       : state?.botStatus.botInfo?.first_name ?? 'BazarBot';
 
   const selectTab = (tab: NavTab) => {
+    if (activeTab === 'settings' && tab !== 'settings' && state?.config) {
+      setDraftConfig(state.config);
+    }
     setActiveTab(tab);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
@@ -995,37 +1047,70 @@ export default function App() {
                     </span>
                   </div>
                 )}
-                <button
-                  type="button"
-                  disabled={savingConfig}
-                  onClick={() => void handleSaveConfig({ enabled: !schedulerEnabled })}
-                  className={`ui-btn w-full py-3.5 text-[14.5px] font-extrabold rounded-[12px] ${
-                    schedulerEnabled
-                      ? 'ui-btn-stop'
-                      : activeProductsCount === 0
-                      ? 'ui-btn-outline opacity-75'
-                      : 'ui-btn-success'
-                  }`}
-                >
-                  <i
-                    className={`text-lg ${
-                      savingConfig
-                        ? 'ri-loader-4-line animate-spin'
-                        : schedulerEnabled
-                        ? 'ri-stop-circle-fill'
-                        : 'ri-play-circle-fill'
+                {schedulerEnabled &&
+                  state.config.activeHoursEnabled &&
+                  !isWithinDhakaActiveHours(state.config, nowMs) && (
+                    <div className="p-2.5 rounded-[10px] bg-[#eff6ff] border border-[#bfdbfe] text-[11.5px] font-bold text-[#1d4ed8] flex items-center gap-2">
+                      <i className="ri-moon-clear-fill text-sm shrink-0" />
+                      <span>
+                        নির্ধারিত সময়সীমার বাইরে ({formatHourRangeLabel(state.config.activeStartHour, state.config.activeEndHour)} Dhaka) — সময় শুরু হলে অটো-পোস্ট নিজে থেকেই চলবে, অথবা ২৪ ঘণ্টা চালাতে সেটিংস থেকে সক্রিয় সময়সীমা বন্ধ করুন।
+                      </span>
+                    </div>
+                  )}
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    disabled={savingConfig}
+                    onClick={() => void handleSaveConfig({ enabled: !schedulerEnabled })}
+                    className={`ui-btn w-full py-3.5 text-[14.5px] font-extrabold rounded-[12px] ${
+                      schedulerEnabled
+                        ? 'ui-btn-stop'
+                        : activeProductsCount === 0
+                        ? 'ui-btn-outline opacity-75'
+                        : 'ui-btn-success'
                     }`}
-                  />
-                  <span>
-                    {savingConfig
-                      ? 'আপডেট হচ্ছে...'
-                      : schedulerEnabled
-                      ? 'Stop — অটো-পোস্ট সিস্টেম বন্ধ করুন'
-                      : activeProductsCount === 0
-                      ? 'Start বন্ধ (আগে পোস্ট তৈরি করুন)'
-                      : 'Start — অটো-পোস্ট সিস্টেম চালু করুন'}
-                  </span>
-                </button>
+                  >
+                    <i
+                      className={`text-lg ${
+                        savingConfig
+                          ? 'ri-loader-4-line animate-spin'
+                          : schedulerEnabled
+                          ? 'ri-stop-circle-fill'
+                          : 'ri-play-circle-fill'
+                      }`}
+                    />
+                    <span>
+                      {savingConfig
+                        ? 'আপডেট হচ্ছে...'
+                        : schedulerEnabled
+                        ? 'Stop — অটো-পোস্ট সিস্টেম বন্ধ করুন'
+                        : activeProductsCount === 0
+                        ? 'Start বন্ধ (আগে পোস্ট তৈরি করুন)'
+                        : 'Start — অটো-পোস্ট সিস্টেম চালু করুন'}
+                    </span>
+                  </button>
+
+                  {activeProductsCount > 0 && enabledGroupsCount > 0 && (
+                    <button
+                      type="button"
+                      disabled={broadcastingNow}
+                      onClick={() => void handleBroadcastNow()}
+                      className="ui-btn ui-btn-outline w-full py-2.5 text-[12.5px] font-bold"
+                    >
+                      <i
+                        className={
+                          broadcastingNow ? 'ri-loader-4-line animate-spin' : 'ri-send-plane-2-fill'
+                        }
+                        style={{ color: '#2563eb' }}
+                      />
+                      <span>
+                        {broadcastingNow
+                          ? 'গ্রুপগুলোতে পোস্ট পাঠানো হচ্ছে...'
+                          : `এখনই ১ রাউন্ড পোস্ট পাঠান (${enabledGroupsCount}টি সক্রিয় গ্রুপ)`}
+                      </span>
+                    </button>
+                  )}
+                </div>
 
                 {/* 3. 4-Column Stat Cards */}
                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
@@ -1067,10 +1152,12 @@ export default function App() {
                     <div className="min-w-0">
                       <p className="text-[10.5px] font-bold text-[#64748b] uppercase">পোস্ট বিরতি</p>
                       <p className="text-lg font-extrabold text-[#0f172a] ui-mono mt-0.5 truncate">
-                        {formatIntervalLabel(currentConfig.intervalMinutes)}
+                        {formatIntervalLabel(state.config.intervalMinutes)}
                       </p>
                       <p className="text-[10.5px] text-[#64748b] truncate mt-0.5">
-                        গ্রুপ গ্যাপ {currentConfig.delayBetweenGroupsSec} সে.
+                        {state.config.activeHoursEnabled
+                          ? `সময়: ${formatHourRangeLabel(state.config.activeStartHour, state.config.activeEndHour)}`
+                          : `২৪ ঘণ্টা • গ্যাপ ${state.config.delayBetweenGroupsSec} সে.`}
                       </p>
                     </div>
                     <div className="ui-stat-ico" style={accentVars(ACCENTS.violet)}>
@@ -1690,6 +1777,7 @@ export default function App() {
                 userbotStatus={state.userbotStatus}
                 authToken={authToken}
                 currentConfig={currentConfig}
+                savedConfig={state.config}
                 activeMode={activeMode}
                 savingConfig={savingConfig}
                 onDraftConfigChange={setDraftConfig}

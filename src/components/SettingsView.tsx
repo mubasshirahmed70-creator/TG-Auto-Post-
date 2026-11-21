@@ -20,6 +20,7 @@ interface SettingsViewProps {
   userbotStatus: UserbotStatus;
   authToken: string;
   currentConfig: SchedulerConfig;
+  savedConfig: SchedulerConfig;
   activeMode: PostingMode;
   savingConfig: boolean;
   onDraftConfigChange: (next: SchedulerConfig) => void;
@@ -35,6 +36,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   userbotStatus,
   authToken,
   currentConfig,
+  savedConfig,
   activeMode,
   savingConfig,
   onDraftConfigChange,
@@ -51,6 +53,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [showCodeEditor, setShowCodeEditor] = useState(false);
   const [resetScopeConfirm, setResetScopeConfirm] = useState<'posts' | 'groups' | 'all' | null>(null);
   const [resetting, setResetting] = useState(false);
+
+  const hasUnsavedChanges =
+    currentConfig.postingMode !== savedConfig.postingMode ||
+    currentConfig.intervalMinutes !== savedConfig.intervalMinutes ||
+    currentConfig.delayBetweenGroupsSec !== savedConfig.delayBetweenGroupsSec ||
+    currentConfig.activeHoursEnabled !== savedConfig.activeHoursEnabled ||
+    currentConfig.activeStartHour !== savedConfig.activeStartHour ||
+    currentConfig.activeEndHour !== savedConfig.activeEndHour ||
+    currentConfig.rotationMode !== savedConfig.rotationMode ||
+    currentConfig.sellerContactUrl !== savedConfig.sellerContactUrl ||
+    currentConfig.buttonText !== savedConfig.buttonText;
 
   const handleConfirmReset = async () => {
     if (!resetScopeConfirm) return;
@@ -328,22 +341,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
           {/* Active Hours Window */}
           <div className="p-3 rounded-[10px] bg-[#f8fafc] border border-[#e2e8f0] space-y-2.5">
-            <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={currentConfig.activeHoursEnabled}
-                onChange={(e) =>
-                  onDraftConfigChange({
-                    ...currentConfig,
-                    activeHoursEnabled: e.target.checked,
-                  })
-                }
-                className="w-4 h-4 rounded border-[#cbd5e1] text-[#2563eb] focus:ring-[#2563eb]"
-              />
-              <span className="text-[12px] font-bold text-[#0f172a]">
-                শুধুমাত্র দিনের নির্ধারিত সময়ে পোস্ট হবে (বাংলাদেশ সময়)
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={currentConfig.activeHoursEnabled}
+                  onChange={(e) =>
+                    onDraftConfigChange({
+                      ...currentConfig,
+                      activeHoursEnabled: e.target.checked,
+                    })
+                  }
+                  className="w-4 h-4 rounded border-[#cbd5e1] text-[#2563eb] focus:ring-[#2563eb]"
+                />
+                <span className="text-[12px] font-bold text-[#0f172a]">
+                  শুধুমাত্র দিনের নির্ধারিত সময়ে পোস্ট হবে (বাংলাদেশ সময়)
+                </span>
+              </label>
+
+              <span
+                className={`ui-badge shrink-0 ${
+                  currentConfig.activeHoursEnabled ? 'ui-badge-info' : 'ui-badge-ok'
+                }`}
+              >
+                {currentConfig.activeHoursEnabled
+                  ? `সময়: ${String(currentConfig.activeStartHour).padStart(2, '0')}:00–${String(currentConfig.activeEndHour).padStart(2, '0')}:59`
+                  : '২৪ ঘণ্টা চলবে (সব সময়)'}
               </span>
-            </label>
+            </div>
 
             {currentConfig.activeHoursEnabled && (
               <div className="flex flex-wrap items-center gap-2 text-[11.5px] font-semibold text-[#475569] pl-6">
@@ -422,12 +447,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
 
         {/* Action Footer (Save Configuration Only) */}
-        <div className="px-3.5 py-3 border-t border-[#f1f5f9] bg-[#f8fafc]/60 flex items-center justify-end">
+        <div className="px-3.5 py-3 border-t border-[#f1f5f9] bg-[#f8fafc]/60 flex flex-wrap items-center justify-between gap-2.5">
+          <div className="text-[11.5px] font-bold">
+            {hasUnsavedChanges ? (
+              <span className="text-[#b45309] flex items-center gap-1.5">
+                <i className="ri-error-warning-fill text-sm" />
+                পরিবর্তন এখনো সেভ হয়নি — কার্যকর করতে পাশের বাটনে চাপ দিন
+              </span>
+            ) : (
+              <span className="text-[#059669] flex items-center gap-1.5">
+                <i className="ri-checkbox-circle-fill text-sm" />
+                বর্তমান সেটিংস ডাটাবেজে সেভ আছে
+              </span>
+            )}
+          </div>
           <button
             type="button"
             disabled={savingConfig}
             onClick={() => void onSaveConfig()}
-            className="ui-btn ui-btn-primary"
+            className={`ui-btn ${hasUnsavedChanges ? 'ui-btn-success' : 'ui-btn-primary'}`}
           >
             <i className="ri-save-3-fill" />
             {savingConfig ? 'সেভ হচ্ছে...' : 'সেটিংস সেভ করুন'}
